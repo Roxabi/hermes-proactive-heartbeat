@@ -7,7 +7,7 @@ Native Hermes plugin for an extensible proactive heartbeat: collectors emit sign
 Pin an exact commit SHA:
 
 ```bash
-hermes plugins install Roxabi/hermes-proactive-heartbeat --ref 52fec53d2b51fcebc24869697b6fd0223298f976
+hermes plugins install Roxabi/hermes-proactive-heartbeat --ref a6896b9b194ed9bbea955acf233552d2f0e62782
 hermes plugins enable proactive-heartbeat
 hermes proactive-heartbeat setup
 ```
