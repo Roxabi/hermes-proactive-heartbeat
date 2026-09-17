@@ -1,0 +1,14 @@
+# Local net. CI remains the authority gate (.github/workflows/ci.yml).
+pre-commit:
+  parallel: true
+  commands:
+    ruff-check:
+      run: ruff check .
+    ruff-format:
+      run: ruff format --check .
+
+pre-push:
+  parallel: false
+  commands:
+    test:
+      run: python3 -m unittest discover -s tests -v

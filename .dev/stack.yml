@@ -1,0 +1,37 @@
+schema_version: "1.0"
+runtime: python
+package_manager: python
+
+backend:
+  framework: none
+  path: .
+frontend:
+  framework: none
+  path: ""
+build:
+  orchestrator: none
+  formatter: ruff
+  formatter_fix_cmd: ruff format .
+testing:
+  unit: unittest
+  e2e: none
+hooks:
+  tool: lefthook
+lsp:
+  enabled: true
+deploy:
+  platform: none
+docs:
+  framework: markdown
+  path: .
+  format: md
+commands:
+  format: ruff format .
+  lint: ruff check .
+  typecheck: python3 -m compileall -q .
+  test: python3 -m unittest discover -s tests -v
+standards:
+  agent_rules: AGENTS.md
+  backend: AGENTS.md
+  testing: AGENTS.md
+  contributing: README.md

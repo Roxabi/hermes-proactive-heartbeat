@@ -1,0 +1,16 @@
+[project]
+name = "hermes-proactive-heartbeat"
+version = "0.0.1"
+description = "Extensible proactive heartbeat plugin for Hermes"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+[project.optional-dependencies]
+dev = ["ruff==0.15.10"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

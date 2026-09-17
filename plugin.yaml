@@ -1,0 +1,24 @@
+name: proactive-heartbeat
+version: 0.0.1
+manifest_version: 1
+api_version: 1
+kind: standalone
+description: Extensible proactive heartbeat for Hermes with deterministic gates and optional TypeSafe filtering.
+author: Roxabi
+license: MIT
+homepage: https://github.com/Roxabi/hermes-proactive-heartbeat
+tags: [automation, heartbeat, monitoring, cron]
+requires_hermes: ">=0.21.3"
+provides_tools: []
+provides_hooks: []
+optional_env:
+  - name: TYPESAFE_API_KEY
+    description: Optional TypeSafe API key for semantic judgments; deterministic fallbacks remain available without it.
+    secret: true
+config_schema:
+  typesafe_url: {type: str, default: "https://api.typesafe.ai/v1/systemone", description: "TypeSafe System One endpoint"}
+  typesafe_model: {type: str, default: "jev-latest", description: "TypeSafe System One model"}
+  typesafe_threshold: {type: float, default: 0.65, description: "Noul inclusion threshold"}
+  default_cooldown_seconds: {type: int, default: 14400, description: "Default repeat cooldown"}
+  use_cases: {type: dict, default: {}, description: "Use-case-specific local configuration"}
+  delivery: {type: dict, default: {}, description: "Cron delivery configuration used by setup"}
