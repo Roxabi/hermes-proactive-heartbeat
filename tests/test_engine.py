@@ -123,7 +123,13 @@ class HeartbeatEngineTests(IsolatedHomeTestCase):
                 "use_cases": {
                     "host": {"state": {"sample": 1}, "active": ["disk:root"]},
                 },
-                "delivered": {},
+                "delivered": {
+                    "host:disk:root": {
+                        "at": "2026-09-17T12:00:00Z",
+                        "action": "baseline",
+                    }
+                },
+                "pending": [],
             },
         )
 
@@ -200,11 +206,41 @@ class HeartbeatEngineTests(IsolatedHomeTestCase):
         self.assertTrue(any(question_id.startswith("beta:") for question_id in question_ids))
         self.assertIsNotNone(result.candidate)
         assert result.candidate is not None
-        self.assertEqual(result.candidate.use_case, "beta")
+        self.assertEqual(result.candidate.collector, "beta")
         self.assertEqual(result.candidate.fingerprint, "high")
         self.assertEqual(result.candidate.action.priority, 80)
 
-    def test_failed_collector_does_not_block_other_use_cases(self) -> None:
+    def test_non_winning_candidate_remains_pending_for_the_next_tick(self) -> None:
+        low_signal = choice_signal("low", priority=20)
+        high_signal = choice_signal("high", priority=80)
+        low = FakeUseCase(
+            "alpha",
+            [Snapshot(), Snapshot(signals=(low_signal,)), Snapshot(signals=(low_signal,))],
+        )
+        high = FakeUseCase(
+            "beta",
+            [Snapshot(), Snapshot(signals=(high_signal,)), Snapshot(signals=(high_signal,))],
+        )
+
+        def answer_notify(questions: Any) -> dict[str, Any]:
+            return {
+                question_id: choice_answer("notify")
+                for question_id, _question in question_items(questions)
+            }
+
+        engine = HeartbeatEngine([high, low], typesafe=FakeTypeSafe(answer_notify))
+        baseline = engine.tick(context(), previous_state=None)
+        first = engine.tick(context(), previous_state=baseline.state)
+        second = engine.tick(context(), previous_state=first.state)
+
+        assert first.candidate is not None
+        assert second.candidate is not None
+        self.assertEqual(first.candidate.collector, "beta")
+        self.assertEqual(first.state["pending"], ["alpha:low"])
+        self.assertEqual(second.candidate.collector, "alpha")
+        self.assertEqual(second.state["pending"], [])
+
+    def test_failed_collector_fails_closed_and_queues_healthy_dues(self) -> None:
         failing = FakeUseCase("broken", [RuntimeError("collector offline")])
         healthy = FakeUseCase(
             "healthy",
@@ -217,6 +253,7 @@ class HeartbeatEngineTests(IsolatedHomeTestCase):
                 "healthy": {"state": {}, "active": []},
             },
             "delivered": {},
+            "pending": [],
         }
 
         result = HeartbeatEngine(
@@ -224,13 +261,15 @@ class HeartbeatEngineTests(IsolatedHomeTestCase):
             typesafe=FakeTypeSafe(None),
         ).tick(context(), previous_state=previous)
 
-        self.assertIsNotNone(result.candidate)
-        assert result.candidate is not None
-        self.assertEqual(result.candidate.use_case, "healthy")
+        # Hard collector failures fail closed: no wake this tick; queue healthy dues.
+        self.assertIsNone(result.candidate)
+        self.assertEqual(result.render(), '{"wakeAgent": false}')
         self.assertEqual(
             result.state["use_cases"]["broken"],
             {"state": {"cursor": "keep"}, "active": ["old"]},
         )
+        self.assertEqual(result.state["use_cases"]["healthy"]["active"], ["new"])
+        self.assertEqual(result.state["pending"], ["healthy:new"])
         self.assertIn("broken", result.diagnostics)
 
     def test_delivered_signal_stays_silent_inside_default_cooldown(self) -> None:
@@ -272,6 +311,24 @@ class HeartbeatEngineTests(IsolatedHomeTestCase):
         self.assertEqual(result.candidate.fingerprint, "disk:root")
         self.assertEqual(len(typesafe.calls), 2)
 
+    def test_active_signal_without_a_delivery_record_stays_eligible(self) -> None:
+        signal = choice_signal("disk:root", fallback_label="notify")
+        previous = {
+            "version": 1,
+            "use_cases": {"host": {"state": {}, "active": ["disk:root"]}},
+            "delivered": {},
+            "pending": [],
+        }
+
+        result = HeartbeatEngine(
+            [FakeUseCase("host", [Snapshot(signals=(signal,), state={"sample": 1})])],
+            typesafe=FakeTypeSafe(None),
+        ).tick(context(), previous_state=previous)
+
+        self.assertIsNotNone(result.candidate)
+        assert result.candidate is not None
+        self.assertEqual(result.candidate.fingerprint, "disk:root")
+
     def test_per_signal_repeat_after_gates_reeligibility(self) -> None:
         signal = choice_signal("disk:root", fallback_label="notify", repeat_after_seconds=60)
         snapshot = Snapshot(signals=(signal,), state={"sample": 1})
@@ -310,7 +367,7 @@ class TickResultRenderingTests(IsolatedHomeTestCase):
 
     def test_wake_render_is_one_compact_candidate_object_without_gate_line(self) -> None:
         candidate = Candidate(
-            use_case="sense",
+            collector="sense",
             fingerprint="care:water",
             action=action("water", 70),
             facts={"plant": "fern"},
@@ -326,11 +383,17 @@ class TickResultRenderingTests(IsolatedHomeTestCase):
             json.loads(rendered),
             {
                 "heartbeat_candidate": {
-                    "use_case": "sense",
+                    "collector": "sense",
                     "fingerprint": "care:water",
                     "action": "water",
                     "priority": 70,
-                    "facts": {"plant": "fern"},
+                    "inputs": {"plant": "fern"},
+                    "judgment": {
+                        "label": "water",
+                        "action": "water",
+                        "source": "fallback",
+                    },
+                    "context": {},
                     "delivery": {
                         "instruction": "Deliver water",
                         "max_sentences": 2,

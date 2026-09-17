@@ -8,6 +8,11 @@ import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
+try:
+    from . import _bootstrap  # noqa: F401
+except ImportError:  # flat plugin-dir / unittest load
+    import _bootstrap  # noqa: F401
+
 JsonObject = dict[str, Any]
 RunCommand = Callable[[Sequence[str], float], str]
 
@@ -17,50 +22,6 @@ DEFAULT_SSH_OPTIONS: tuple[str, ...] = (
     "-o",
     "ConnectTimeout=8",
 )
-
-DEFAULT_HOST_PROBE = r"""
-python3 - <<'PY'
-import json, os, shutil, subprocess
-home = os.path.expanduser("~")
-du = shutil.disk_usage(home)
-load = os.getloadavg()
-failed = 0
-try:
-    p = subprocess.run(
-        ["systemctl", "--user", "--failed", "--no-legend"],
-        capture_output=True, text=True, timeout=3,
-    )
-    failed = len([
-        line for line in p.stdout.splitlines()
-        if line.strip() and "autostart" not in line.lower()
-    ])
-except Exception:
-    failed = -1
-out = {
-    "load1": round(load[0], 2),
-    "disk_pct": round(100 * du.used / du.total, 1),
-    "failed_units": failed,
-}
-try:
-    g = subprocess.run(
-        [
-            "nvidia-smi",
-            "--query-gpu=memory.used,memory.free",
-            "--format=csv,noheader,nounits",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=3,
-    )
-    if g.returncode == 0 and g.stdout.strip():
-        used, free = [part.strip() for part in g.stdout.strip().split(",")[:2]]
-        out["gpu_used_mib"] = int(float(used))
-        out["gpu_free_mib"] = int(float(free))
-except Exception:
-    pass
-print(json.dumps(out, separators=(",", ":")))
-PY
-""".strip()
 
 
 def default_run_command(argv: Sequence[str], timeout: float) -> str:

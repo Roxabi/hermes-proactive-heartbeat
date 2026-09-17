@@ -52,18 +52,33 @@ class Snapshot:
 class Candidate:
     """A resolved signal eligible for one Hermes agent wake."""
 
-    use_case: str
+    collector: str
     fingerprint: str
     action: ActionSpec
     facts: JsonObject
+    context: JsonObject = field(default_factory=dict)
+    judgment: JsonObject = field(default_factory=dict)
 
     def as_json(self) -> JsonObject:
+        label = self.judgment.get("label") if isinstance(self.judgment, Mapping) else None
+        source = self.judgment.get("source") if isinstance(self.judgment, Mapping) else None
         return {
-            "use_case": self.use_case,
+            "collector": self.collector,
             "fingerprint": self.fingerprint,
             "action": self.action.name,
             "priority": self.action.priority,
-            "facts": self.facts,
+            "inputs": self.facts,
+            "judgment": {
+                "label": label or self.action.name,
+                "action": self.action.name,
+                "source": source or "fallback",
+                **{
+                    key: value
+                    for key, value in (self.judgment or {}).items()
+                    if key not in {"label", "action", "source"}
+                },
+            },
+            "context": self.context,
             "delivery": {
                 "instruction": self.action.instruction,
                 "max_sentences": self.action.max_sentences,

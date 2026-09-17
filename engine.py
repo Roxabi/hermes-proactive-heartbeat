@@ -80,10 +80,14 @@ class HeartbeatEngine:
         prior = _coerce_previous(previous_state if previous_state is not None else previous)
         is_baseline = prior is None
         previous_root = prior or _empty_state()
+        previous_pending = {
+            str(item) for item in (previous_root.get("pending") or []) if isinstance(item, str)
+        }
 
         diagnostics: JsonObject = {}
         next_use_cases: dict[str, JsonObject] = {}
         due: list[_DueSignal] = []
+        retained_pending: set[str] = set()
 
         for use_case in self.use_cases:
             previous_entry = _use_case_entry(previous_root, use_case.id)
@@ -100,6 +104,9 @@ class HeartbeatEngine:
                 }
                 if isinstance(previous_entry.get("diagnostics"), dict):
                     next_use_cases[use_case.id]["diagnostics"] = dict(previous_entry["diagnostics"])
+                retained_pending.update(
+                    key for key in previous_pending if key.startswith(f"{use_case.id}:")
+                )
                 continue
 
             if not isinstance(snapshot, Snapshot):
@@ -111,6 +118,9 @@ class HeartbeatEngine:
                     "state": dict(previous_entry.get("state") or {}),
                     "active": list(previous_entry.get("active") or []),
                 }
+                retained_pending.update(
+                    key for key in previous_pending if key.startswith(f"{use_case.id}:")
+                )
                 continue
 
             active_fingerprints = [signal.fingerprint for signal in snapshot.signals]
@@ -119,7 +129,8 @@ class HeartbeatEngine:
                 "active": list(active_fingerprints),
             }
             if snapshot.diagnostics:
-                next_entry["diagnostics"] = dict(snapshot.diagnostics)
+                # Soft collector notes stay in use-case state only — they must not fail the tick.
+                next_entry["diagnostics"] = _bound_facts(snapshot.diagnostics)
             next_use_cases[use_case.id] = next_entry
 
             if is_baseline:
@@ -136,6 +147,7 @@ class HeartbeatEngine:
                     delivered=previous_root.get("delivered") or {},
                     now=context.now,
                     default_cooldown=_default_cooldown(context.settings),
+                    pending=previous_pending,
                 ):
                     due.append(
                         _DueSignal(
@@ -145,7 +157,45 @@ class HeartbeatEngine:
                         )
                     )
 
-        answers = self._evaluate_due(context, due) if due and not is_baseline else None
+        delivered = dict(previous_root.get("delivered") or {})
+        if is_baseline:
+            # Stamp baseline observations so cooldown can expire and re-evaluate later.
+            for use_case_id, entry in next_use_cases.items():
+                for fingerprint in entry.get("active") or []:
+                    if not isinstance(fingerprint, str):
+                        continue
+                    delivered[_delivery_key(use_case_id, fingerprint)] = {
+                        "at": _iso(context.now),
+                        "action": "baseline",
+                    }
+            return TickResult(
+                candidate=None,
+                state={
+                    "version": STATE_VERSION,
+                    "use_cases": next_use_cases,
+                    "delivered": delivered,
+                    "pending": sorted(retained_pending),
+                },
+                diagnostics=diagnostics,
+            )
+
+        if diagnostics:
+            # Hard collector failures: fail closed — no wake, queue due signals for retry.
+            queued = retained_pending | {
+                _delivery_key(item.use_case_id, item.signal.fingerprint) for item in due
+            }
+            return TickResult(
+                candidate=None,
+                state={
+                    "version": STATE_VERSION,
+                    "use_cases": next_use_cases,
+                    "delivered": delivered,
+                    "pending": sorted(queued),
+                },
+                diagnostics=diagnostics,
+            )
+
+        answers = self._evaluate_due(context, due) if due else None
         candidates = [
             candidate
             for item in due
@@ -153,6 +203,7 @@ class HeartbeatEngine:
                 _resolve_candidate(
                     item,
                     answers,
+                    context=context,
                     threshold=_threshold(context.settings),
                 )
             ]
@@ -160,19 +211,39 @@ class HeartbeatEngine:
         ]
         winner = _select_winner(candidates)
 
-        delivered = dict(previous_root.get("delivered") or {})
         if winner is not None:
-            delivered[_delivery_key(winner.use_case, winner.fingerprint)] = {
+            delivered[_delivery_key(winner.collector, winner.fingerprint)] = {
                 "at": _iso(context.now),
                 "action": winner.action.name,
             }
 
-        next_state: JsonObject = {
-            "version": STATE_VERSION,
-            "use_cases": next_use_cases,
-            "delivered": delivered,
+        winner_key = (
+            _delivery_key(winner.collector, winner.fingerprint) if winner is not None else None
+        )
+        candidate_keys = {
+            _delivery_key(candidate.collector, candidate.fingerprint) for candidate in candidates
         }
-        return TickResult(candidate=winner, state=next_state, diagnostics=diagnostics)
+        for item in due:
+            key = _delivery_key(item.use_case_id, item.signal.fingerprint)
+            if key == winner_key or key in candidate_keys:
+                continue
+            # Silent / unresolved due signals get a stamp so cooldown applies.
+            delivered[key] = {
+                "at": _iso(context.now),
+                "action": "silent",
+            }
+
+        next_pending = retained_pending | {key for key in candidate_keys if key != winner_key}
+        return TickResult(
+            candidate=winner,
+            state={
+                "version": STATE_VERSION,
+                "use_cases": next_use_cases,
+                "delivered": delivered,
+                "pending": sorted(next_pending),
+            },
+            diagnostics=diagnostics,
+        )
 
     def _evaluate_due(
         self,
@@ -224,7 +295,7 @@ def _coerce_previous(previous: Mapping[str, Any] | None) -> JsonObject | None:
 
 
 def _empty_state() -> JsonObject:
-    return {"version": STATE_VERSION, "use_cases": {}, "delivered": {}}
+    return {"version": STATE_VERSION, "use_cases": {}, "delivered": {}, "pending": []}
 
 
 def _use_case_entry(state: Mapping[str, Any], use_case_id: str) -> JsonObject:
@@ -273,19 +344,24 @@ def _is_due(
     signal: Signal,
     previous_active: set[str],
     delivered: Mapping[str, Any],
+    pending: set[str],
     now: datetime,
     default_cooldown: int,
 ) -> bool:
     fingerprint = signal.fingerprint
+    delivery_key = _delivery_key(use_case_id, fingerprint)
+    if delivery_key in pending:
+        return True
     if fingerprint not in previous_active:
         return True
 
-    record = delivered.get(_delivery_key(use_case_id, fingerprint))
+    record = delivered.get(delivery_key)
     if not isinstance(record, Mapping):
-        return False
+        # Active but never delivered: stay eligible instead of silently suppressing forever.
+        return True
     delivered_at = _parse_time(record.get("at"))
     if delivered_at is None:
-        return False
+        return True
 
     cooldown = (
         signal.repeat_after_seconds if signal.repeat_after_seconds is not None else default_cooldown
@@ -303,11 +379,13 @@ def _resolve_candidate(
     item: _DueSignal,
     answers: Mapping[str, Any] | None,
     *,
+    context: TickContext,
     threshold: float,
 ) -> Candidate | None:
     judgment = item.signal.judgment
+    raw_answer = answers.get(item.question_id) if isinstance(answers, Mapping) else None
     label = _label_for_answer(
-        answers.get(item.question_id) if isinstance(answers, Mapping) else None,
+        raw_answer,
         judgment=judgment,
         threshold=threshold,
     )
@@ -323,11 +401,41 @@ def _resolve_candidate(
         return None
 
     return Candidate(
-        use_case=item.use_case_id,
+        collector=item.use_case_id,
         fingerprint=item.signal.fingerprint,
         action=action,
         facts=_bound_facts(item.signal.facts),
+        context=_candidate_context(context),
+        judgment=_judgment_meta(label=label, action=action, answer=raw_answer),
     )
+
+
+def _candidate_context(context: TickContext) -> JsonObject:
+    extra = context.settings.get("context")
+    merged: JsonObject = {}
+    if isinstance(extra, Mapping):
+        merged.update({key: value for key, value in extra.items() if value is not None})
+    name = context.settings.get("name")
+    if isinstance(name, str) and name:
+        merged["heartbeat"] = name
+    merged["now"] = _iso(context.now)
+    return _bound_facts(merged)
+
+
+def _judgment_meta(*, label: str, action: Any, answer: Any) -> JsonObject:
+    meta: JsonObject = {
+        "label": label,
+        "action": action.name,
+        "source": "typesafe" if answer is not None else "fallback",
+    }
+    if isinstance(answer, Mapping):
+        for key in ("type", "choice", "noul"):
+            if key in answer:
+                meta[key] = answer[key]
+        probs = answer.get("probabilities")
+        if isinstance(probs, Mapping):
+            meta["probabilities"] = _bound_facts(probs)
+    return meta
 
 
 def _label_for_answer(
@@ -381,7 +489,7 @@ def _select_winner(candidates: list[Candidate]) -> Candidate | None:
         candidates,
         key=lambda candidate: (
             -candidate.action.priority,
-            candidate.use_case,
+            candidate.collector,
             candidate.fingerprint,
         ),
     )[0]

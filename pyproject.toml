@@ -1,7 +1,7 @@
 [project]
-name = "hermes-proactive-heartbeat"
+name = "hermes-proactive-heartbeats"
 version = "0.0.1"
-description = "Extensible proactive heartbeat plugin for Hermes"
+description = "Extensible proactive heartbeats plugin for Hermes"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 

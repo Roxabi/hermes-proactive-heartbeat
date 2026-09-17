@@ -34,4 +34,4 @@ standards:
   agent_rules: AGENTS.md
   backend: AGENTS.md
   testing: AGENTS.md
-  contributing: README.md
+  contributing: CONTRIBUTING.md

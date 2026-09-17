@@ -4,10 +4,12 @@ Public native Hermes plugin. Keep the runtime generic: hostnames, repositories, 
 
 ## Runtime boundaries
 
-- Hermes Cron owns scheduling, the `wakeAgent` script gate, and delivery.
-- The plugin owns collection, deterministic gates, TypeSafe batching, deduplication, and plugin state.
+- Hermes Cron owns scheduling, the `wakeAgent` script gate, and delivery — one cron job per named heartbeat file.
+- The plugin owns collection runtime, deterministic gates, TypeSafe batching, deduplication, and per-heartbeat plugin state (`heartbeat:{name}`).
+- Collector implementations live under `$HERMES_HOME/proactive-heartbeats/collectors/`, never in this repository.
 - `register(ctx)` only registers surfaces; setup and filesystem writes happen through explicit CLI commands.
 - A quiet tick ends with the exact standalone line `{"wakeAgent": false}`.
+- Operator config lives under `$HERMES_HOME/proactive-heartbeats/`.
 
 ## Quality
 

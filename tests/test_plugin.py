@@ -12,7 +12,7 @@ from unittest import mock
 from tests.isolation import IsolatedHomeTestCase
 
 ROOT = Path(__file__).resolve().parents[1]
-PACKAGE_NAME = "hermes_proactive_heartbeat"
+PACKAGE_NAME = "hermes_proactive_heartbeats"
 
 
 class FakeState:
@@ -131,7 +131,7 @@ class PluginRegistrationTests(IsolatedHomeTestCase):
 
         self.assertEqual(len(ctx.commands), 1)
         command = ctx.commands[0]
-        self.assertEqual(command["name"], "proactive-heartbeat")
+        self.assertEqual(command["name"], "proactive-heartbeats")
         self.assertTrue(callable(command["setup_fn"]))
         self.assertTrue(callable(command["handler_fn"]))
         self.assertEqual(ctx.state.sets, [])
@@ -158,26 +158,26 @@ class PluginTickHandlerTests(IsolatedHomeTestCase):
             "delivered": {},
         }
         rendered = '{"wakeAgent": false}'
-        tick_result = SimpleNamespace(state=next_state, render=lambda: rendered)
+        tick_result = SimpleNamespace(state=next_state, diagnostics={}, render=lambda: rendered)
         engine = SimpleNamespace(tick=mock.Mock(return_value=tick_result))
 
-        ctx = FakeCtx(
-            {
-                "typesafe_url": "https://api.typesafe.ai/v1/systemone",
-                "typesafe_model": "jev-latest",
-                "typesafe_threshold": 0.65,
-                "default_cooldown_seconds": 14_400,
-                "use_cases": {},
-                "delivery": {"schedule": "every 15m", "target": "origin"},
-            }
+        root = self.hermes_home / "proactive-heartbeats"
+        (root / "heartbeats").mkdir(parents=True)
+        (root / "proactive-heartbeats.json").write_text(
+            '{"heartbeats": ["care"]}', encoding="utf-8"
         )
-        ctx.state.set("engine", previous_state)
+        (root / "heartbeats" / "care.json").write_text(
+            '{"delivery": {"target": "origin"}, "collectors": {}}', encoding="utf-8"
+        )
+
+        ctx = FakeCtx()
+        ctx.state.set("heartbeat:care", previous_state)
         ctx.state.sets.clear()
         ctx.state.gets.clear()
 
         register(ctx)
         handler = ctx.commands[0]["handler_fn"]
-        args = SimpleNamespace(proactive_heartbeat_command="tick")
+        args = SimpleNamespace(proactive_heartbeats_command="tick", name="care")
         stdout = io.StringIO()
 
         with (
@@ -195,6 +195,6 @@ class PluginTickHandlerTests(IsolatedHomeTestCase):
         engine_cls.assert_called_once()
         engine.tick.assert_called_once()
         self.assertEqual(engine.tick.call_args.kwargs["previous_state"], previous_state)
-        self.assertIn(("engine", None), ctx.state.gets)
-        self.assertEqual(ctx.state.sets, [("engine", next_state)])
+        self.assertIn(("heartbeat:care", None), ctx.state.gets)
+        self.assertEqual(ctx.state.sets, [("heartbeat:care", next_state)])
         self.assertEqual(stdout.getvalue(), rendered + "\n")

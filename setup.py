@@ -1,9 +1,10 @@
-"""Idempotent shim + Hermes cron reconciliation for proactive-heartbeat."""
+"""Idempotent shim + Hermes cron reconciliation for proactive-heartbeats."""
 
 from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import textwrap
@@ -11,34 +12,34 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-JOB_NAME = "proactive-heartbeat"
-SHIM_BASENAME = "proactive-heartbeat.sh"
-_LEGACY_SHIM_BASENAME = "proactive-heartbeat-tick.py"
+try:
+    from . import _bootstrap  # noqa: F401
+except ImportError:  # flat plugin-dir / unittest load
+    import _bootstrap  # noqa: F401
 
-# Generic agent prompt: consumes heartbeat_candidate.delivery from the prerun script stdout.
+_LEGACY_SHIMS = ("proactive-heartbeat.sh", "proactive-heartbeat-tick.py")
+_LEGACY_JOB = "proactive-heartbeat"
+
 DEFAULT_PROMPT = (
     "Proactive heartbeat wake. The pre-run script stdout ends with a JSON object. "
     "When that object contains heartbeat_candidate, follow "
     "heartbeat_candidate.delivery.instruction and respect "
-    "heartbeat_candidate.delivery.max_sentences. Use heartbeat_candidate.facts only as "
-    "supporting context. Do not invent extra work. If nothing actionable remains, reply "
-    "with exactly [SILENT]."
-)
-
-_SHIM_SOURCE = textwrap.dedent(
-    """\
-    #!/usr/bin/env bash
-    # Contained cron shim: forward to `hermes proactive-heartbeat tick`.
-    set -euo pipefail
-    if ! command -v hermes >/dev/null 2>&1; then
-      echo "hermes executable not found on PATH" >&2
-      exit 127
-    fi
-    exec hermes proactive-heartbeat tick
-    """
+    "heartbeat_candidate.delivery.max_sentences. Ground the message in "
+    "heartbeat_candidate.inputs (collector observations) and "
+    "heartbeat_candidate.context. heartbeat_candidate.judgment is the gated action "
+    "(TypeSafe or fallback) — do not re-litigate it. Do not invent extra work. "
+    "If nothing actionable remains, reply with exactly [SILENT]."
 )
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _config_mod() -> Any:
+    try:
+        from . import config as config_mod
+    except ImportError:  # pragma: no cover
+        import config as config_mod
+    return config_mod
 
 
 def resolve_hermes_home() -> Path:
@@ -48,9 +49,10 @@ def resolve_hermes_home() -> Path:
     return (Path.home() / ".hermes").resolve()
 
 
-def shim_path(home: Path | None = None) -> Path:
+def shim_path(home: Path | None, name: str) -> Path:
     root = home or resolve_hermes_home()
-    return root / "scripts" / SHIM_BASENAME
+    config_mod = _config_mod()
+    return root / "scripts" / config_mod.shim_basename(name)
 
 
 def resolve_hermes_executable() -> str:
@@ -60,18 +62,40 @@ def resolve_hermes_executable() -> str:
     return hermes
 
 
-def write_shim(home: Path | None = None) -> Path:
-    """Create or overwrite the contained executable shim under HERMES_HOME/scripts/."""
+def _shim_source(name: str) -> str:
+    hermes = shlex.quote(resolve_hermes_executable())
+    quoted = shlex.quote(name)
+    return textwrap.dedent(
+        f"""\
+        #!/usr/bin/env bash
+        # Contained cron shim: absolute hermes executable, named tick.
+        set -euo pipefail
+        exec {hermes} proactive-heartbeats tick --name {quoted}
+        """
+    )
+
+
+def write_shim(home: Path | None, name: str) -> Path:
+    """Create or overwrite the per-heartbeat shim under HERMES_HOME/scripts/."""
     root = home or resolve_hermes_home()
     scripts = root / "scripts"
     scripts.mkdir(parents=True, exist_ok=True)
-    path = scripts / SHIM_BASENAME
-    path.write_text(_SHIM_SOURCE, encoding="utf-8")
+    path = shim_path(root, name)
+    path.write_text(_shim_source(name), encoding="utf-8")
     path.chmod(0o755)
-    legacy = scripts / _LEGACY_SHIM_BASENAME
-    if legacy.is_file():
-        legacy.unlink()
     return path
+
+
+def _cleanup_legacy_shims(home: Path) -> None:
+    scripts = home / "scripts"
+    for basename in _LEGACY_SHIMS:
+        legacy = scripts / basename
+        if legacy.is_file():
+            legacy.unlink()
+    try:
+        _run_hermes(["cron", "remove", _LEGACY_JOB])
+    except RuntimeError:
+        return
 
 
 def _run_hermes(args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -84,15 +108,16 @@ def _run_hermes(args: list[str]) -> subprocess.CompletedProcess[str]:
     )
 
 
-def find_cron_job(job_name: str = JOB_NAME) -> dict[str, str] | None:
-    """Read-only locate of our job via ``hermes cron list --all`` (ANSI-stripped)."""
+def list_cron_jobs() -> list[dict[str, str]]:
+    """Parse ``hermes cron list --all`` into id/name rows."""
     try:
         completed = _run_hermes(["cron", "list", "--all"])
     except RuntimeError:
-        return None
+        return []
     if completed.returncode != 0:
-        return None
+        return []
     text = _ANSI_RE.sub("", completed.stdout)
+    jobs: list[dict[str, str]] = []
     current_id = ""
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -101,14 +126,29 @@ def find_cron_job(job_name: str = JOB_NAME) -> dict[str, str] | None:
             current_id = id_match.group(1)
             continue
         name_match = re.match(r"^Name:\s*(.+)$", line)
-        if name_match and name_match.group(1).strip() == job_name:
-            return {"name": job_name, "id": current_id, "raw": line}
+        if name_match:
+            jobs.append({"name": name_match.group(1).strip(), "id": current_id, "raw": line})
+    return jobs
+
+
+def find_cron_job(job_name: str) -> dict[str, str] | None:
+    """Read-only locate of a job via ``hermes cron list --all``."""
+    for job in list_cron_jobs():
+        if job["name"] == job_name:
+            return job
+    return None
+
+
+def _managed_heartbeat_name(job_name: str) -> str | None:
+    prefix = "proactive-heartbeats-"
+    if job_name.startswith(prefix) and job_name != prefix:
+        return job_name[len(prefix) :]
     return None
 
 
 def _delivery_kwargs(delivery: Mapping[str, Any]) -> tuple[str, str, str | None]:
     schedule = str(delivery.get("schedule") or "every 15m").strip() or "every 15m"
-    deliver = str(delivery.get("target") or "origin").strip() or "origin"
+    deliver = str(delivery.get("target") or "local").strip() or "local"
     failure = delivery.get("failure_target")
     failure_target = str(failure).strip() if failure else None
     return schedule, deliver, failure_target or None
@@ -152,9 +192,9 @@ def reconcile_cron_job(
     script_name: str,
     failure_deliver: str | None = None,
     prompt: str = DEFAULT_PROMPT,
-    job_name: str = JOB_NAME,
+    job_name: str,
 ) -> dict[str, Any]:
-    """Create or update the standard job through public ``hermes cron`` commands.
+    """Create or update one job through public ``hermes cron`` commands.
 
     Always keeps ``no_agent=false`` (omit ``--no-agent`` on create; pass ``--agent`` on edit).
     Never writes jobs.json directly. Edit-first against the stable job name avoids duplicates.
@@ -215,7 +255,6 @@ def reconcile_cron_job(
             "stdout": create_completed.stdout.strip(),
         }
 
-    # Race: job appeared between edit-miss and create — one more edit against the name.
     retry = _run_hermes(
         _edit_args(
             job_name,
@@ -244,24 +283,70 @@ def reconcile_cron_job(
     raise RuntimeError(f"hermes cron create failed: {detail}")
 
 
-def run_setup(settings: Mapping[str, Any]) -> dict[str, Any]:
-    """Write the shim and reconcile the cron job from plugin delivery settings."""
+def run_setup(*, config_dir: str | None = None) -> dict[str, Any]:
+    """Write root skeleton and reconcile one cron job per heartbeat file."""
+    config_mod = _config_mod()
     home = resolve_hermes_home()
-    shim = write_shim(home)
-    delivery = settings.get("delivery") if isinstance(settings.get("delivery"), Mapping) else {}
-    schedule, deliver, failure_deliver = _delivery_kwargs(delivery)
-    result = reconcile_cron_job(
-        schedule=schedule,
-        deliver=deliver,
-        script_name=SHIM_BASENAME,
-        failure_deliver=failure_deliver,
+    _cleanup_legacy_shims(home)
+    root_file = config_mod.root_path(home, config_dir=config_dir)
+    root_created = config_mod.write_root_skeleton(root_file)
+    config_mod.collectors_dir(home, config_dir=config_dir).mkdir(parents=True, exist_ok=True)
+    (config_mod.plugin_dir(home, config_dir=config_dir) / config_mod.HEARTBEATS_DIRNAME).mkdir(
+        parents=True, exist_ok=True
     )
+    root = config_mod.load_root(home, config_dir=config_dir)
+    names = config_mod.heartbeat_names(home, config_dir=config_dir)
+    rows: list[dict[str, Any]] = []
+    for name in names:
+        settings = config_mod.load_heartbeat(home, name, root=root, config_dir=config_dir)
+        shim = write_shim(home, name)
+        schedule, deliver, failure_deliver = _delivery_kwargs(settings["delivery"])
+        result = reconcile_cron_job(
+            schedule=schedule,
+            deliver=deliver,
+            script_name=config_mod.shim_basename(name),
+            failure_deliver=failure_deliver,
+            job_name=config_mod.job_name(name),
+        )
+        rows.append(
+            {
+                "name": name,
+                "job_name": result["job_name"],
+                "job_id": result.get("job_id") or "",
+                "action": result["action"],
+                "shim": str(shim),
+                "schedule": schedule,
+                "deliver": deliver,
+                "config_status": "present",
+            }
+        )
+
+    desired = set(names)
+    for job in list_cron_jobs():
+        leftover = _managed_heartbeat_name(job["name"])
+        if leftover is None or leftover in desired:
+            continue
+        _run_hermes(["cron", "remove", job["name"]])
+        shim = shim_path(home, leftover)
+        if shim.is_file():
+            shim.unlink()
+        rows.append(
+            {
+                "name": leftover,
+                "job_name": job["name"],
+                "job_id": job.get("id") or "",
+                "action": "removed",
+                "shim": str(shim),
+                "schedule": "",
+                "deliver": "",
+                "config_status": "missing",
+            }
+        )
+
     return {
-        "action": result["action"],
+        "action": "reconciled",
         "hermes_home": str(home),
-        "shim": str(shim),
-        "job_name": result["job_name"],
-        "job_id": result.get("job_id") or "",
-        "schedule": schedule,
-        "deliver": deliver,
+        "root": str(root_file),
+        "root_status": "created" if root_created else "present",
+        "heartbeats": rows,
     }

@@ -1,4 +1,4 @@
-"""Proactive heartbeat Hermes plugin — CLI registration only."""
+"""Proactive heartbeats Hermes plugin — CLI registration only."""
 
 from __future__ import annotations
 
@@ -13,19 +13,20 @@ if _ROOT_S not in sys.path:
 
 
 def register(ctx: Any) -> None:
-    """Register the ``proactive-heartbeat`` CLI subtree. No hooks, tools, or background work."""
+    """Register the ``proactive-heartbeats`` CLI subtree. No hooks, tools, or background work."""
     from . import cli
 
     def _handler(args: Any) -> int:
         return cli.handle(ctx, args)
 
     ctx.register_cli_command(
-        name="proactive-heartbeat",
-        help="Run and manage the proactive heartbeat tick pipeline",
+        name="proactive-heartbeats",
+        help="Run and manage named proactive heartbeat tick pipelines",
         setup_fn=cli.configure_parser,
         handler_fn=_handler,
         description=(
-            "Operator CLI for the proactive heartbeat plugin: tick once, "
-            "inspect status, run doctor checks, and reconcile the Hermes cron job."
+            "Operator CLI for the proactive heartbeats plugin: tick one named "
+            "heartbeat, inspect status, run doctor checks, and reconcile one "
+            "Hermes cron job per heartbeat."
         ),
     )
