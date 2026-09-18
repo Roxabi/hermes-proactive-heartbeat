@@ -259,44 +259,27 @@ class HeartbeatEngine:
             ]
             if candidate is not None
         ]
-        winner = _select_winner(candidates)
-
-        if winner is not None:
-            delivered[_delivery_key(winner.collector, winner.fingerprint)] = {
-                "at": _iso(context.now),
-                "action": winner.action.name,
-            }
-
-        winner_key = (
-            _delivery_key(winner.collector, winner.fingerprint) if winner is not None else None
-        )
-        candidate_keys = {
+        packed = _pack_wake(candidates, context)
+        delivered_keys = {
             _delivery_key(candidate.collector, candidate.fingerprint) for candidate in candidates
         }
+        for candidate in candidates:
+            delivered[_delivery_key(candidate.collector, candidate.fingerprint)] = {
+                "at": _iso(context.now),
+                "action": candidate.action.name,
+            }
+
         for item in due:
             key = _delivery_key(item.use_case_id, item.signal.fingerprint)
-            if key == winner_key or key in candidate_keys:
+            if key in delivered_keys:
                 continue
-            # Silent / unresolved due signals get a stamp so cooldown applies.
             delivered[key] = {
                 "at": _iso(context.now),
                 "action": "silent",
             }
 
-        next_pending = dict(retained_pending)
-        for candidate in candidates:
-            key = _delivery_key(candidate.collector, candidate.fingerprint)
-            if key == winner_key:
-                continue
-            next_pending[key] = {
-                "action": _action_as_json(candidate.action),
-                "decision": dict(candidate.decision),
-                "facts_digest": _facts_digest(candidate.facts),
-                "queued_at": _iso(context.now),
-            }
-
         return TickResult(
-            candidate=winner,
+            candidate=packed,
             state={
                 "version": STATE_VERSION,
                 "use_cases": next_use_cases,
@@ -305,7 +288,7 @@ class HeartbeatEngine:
                     use_cases=next_use_cases,
                     diagnostics=diagnostics,
                 ),
-                "pending": _sorted_pending(next_pending),
+                "pending": _sorted_pending(retained_pending),
             },
             diagnostics=diagnostics,
         )
@@ -642,17 +625,80 @@ def _noul_label(probability: float, *, judgment: JudgmentSpec, threshold: float)
     return judgment.fallback_label
 
 
-def _select_winner(candidates: list[Candidate]) -> Candidate | None:
+def _observation(candidate: Candidate) -> JsonObject:
+    decision = dict(candidate.decision) if isinstance(candidate.decision, Mapping) else {}
+    return {
+        "collector": candidate.collector,
+        "fingerprint": candidate.fingerprint,
+        "facts": candidate.facts,
+        "decision": decision,
+    }
+
+
+def _bundle_action(candidates: list[Candidate]) -> ActionSpec:
+    if len(candidates) == 1:
+        return candidates[0].action
+    instructions = [
+        candidate.action.instruction.strip()
+        for candidate in candidates
+        if candidate.action.instruction.strip()
+    ]
+    joined = " ".join(instructions)
+    return ActionSpec(
+        name="bundle",
+        wake_agent=True,
+        priority=max(candidate.action.priority for candidate in candidates),
+        instruction=(
+            "Cover every observation in inputs. Each entry already includes facts "
+            "and a judgment. Compose one short message that mentions every item. "
+            "Do not add topics that are not in inputs. Do not re-open whether to speak."
+            + ((" " + joined) if joined else "")
+        ),
+        max_sentences=sum(max(1, candidate.action.max_sentences) for candidate in candidates),
+    )
+
+
+def _pack_wake(candidates: list[Candidate], context: TickContext) -> Candidate | None:
+    """Pack every waking candidate into one stdout candidate. Order is priority only."""
     if not candidates:
         return None
-    return sorted(
+    ordered = sorted(
         candidates,
         key=lambda candidate: (
             -candidate.action.priority,
             candidate.collector,
             candidate.fingerprint,
         ),
-    )[0]
+    )
+    observations = tuple(_observation(candidate) for candidate in ordered)
+    action = _bundle_action(ordered)
+    packed_context = _candidate_context(context)
+    if len(ordered) == 1:
+        lead = ordered[0]
+        return Candidate(
+            collector=lead.collector,
+            fingerprint=lead.fingerprint,
+            action=lead.action,
+            facts=lead.facts,
+            context=packed_context,
+            decision=lead.decision,
+            observations=observations,
+        )
+    sources = {
+        str(candidate.decision.get("source") or "fallback")
+        for candidate in ordered
+        if isinstance(candidate.decision, Mapping)
+    }
+    source = sources.pop() if len(sources) == 1 else "bundle"
+    return Candidate(
+        collector="bundle",
+        fingerprint="tick",
+        action=action,
+        facts={},
+        context=packed_context,
+        decision={"action": action.name, "source": source, "count": len(ordered)},
+        observations=observations,
+    )
 
 
 def _first_invalid_signal(signals: tuple[Signal, ...]) -> str | None:

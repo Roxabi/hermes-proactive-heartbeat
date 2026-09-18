@@ -22,13 +22,13 @@ _LEGACY_JOB = "proactive-heartbeat"
 
 DEFAULT_PROMPT = (
     "Proactive heartbeat wake. The pre-run script stdout ends with a JSON object. "
-    "When that object contains heartbeat_candidate, follow "
-    "heartbeat_candidate.delivery.instruction and respect "
-    "heartbeat_candidate.delivery.max_sentences. Ground the message in "
-    "heartbeat_candidate.inputs (collector observations) and "
-    "heartbeat_candidate.context. heartbeat_candidate.decision is the authoritative "
-    "selected action (source rule, typesafe, or fallback) — do not re-litigate it. "
-    "If nothing actionable remains, reply with exactly [SILENT]."
+    "When that object contains heartbeat_candidate, cover every entry in "
+    "heartbeat_candidate.inputs. Each entry already includes facts and the judgment "
+    "(decision). Follow heartbeat_candidate.delivery.instruction and respect "
+    "heartbeat_candidate.delivery.max_sentences. Compose one short message that "
+    "mentions every useful item; do not re-open whether to speak, and do not invent "
+    "topics that are not in inputs. Ground the message in those inputs and "
+    "heartbeat_candidate.context. If inputs is empty, reply with exactly [SILENT]."
 )
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")

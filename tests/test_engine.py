@@ -126,6 +126,20 @@ def context(*, now: datetime = NOW) -> TickContext:
     )
 
 
+def wake_inputs(result: TickResult) -> list[dict[str, Any]]:
+    assert result.candidate is not None
+    inputs = result.candidate.as_json()["inputs"]
+    if not isinstance(inputs, list):
+        raise AssertionError("inputs must be a list of observations")
+    return inputs
+
+
+def observation_ids(result: TickResult) -> list[tuple[str, str]]:
+    return [
+        (str(item.get("collector")), str(item.get("fingerprint"))) for item in wake_inputs(result)
+    ]
+
+
 class HeartbeatEngineTests(IsolatedHomeTestCase):
     def test_first_tick_is_a_silent_baseline_and_persists_active_fingerprints(self) -> None:
         typesafe = FakeTypeSafe({})
@@ -265,7 +279,7 @@ class HeartbeatEngineTests(IsolatedHomeTestCase):
         self.assertEqual(result.candidate.decision["source"], "fallback")
         self.assertEqual(len(typesafe.calls), 1)
 
-    def test_all_due_questions_are_batched_and_highest_priority_candidate_wins(self) -> None:
+    def test_all_due_questions_are_batched_and_packed_into_one_wake(self) -> None:
         low = FakeUseCase(
             "alpha",
             [Snapshot(), Snapshot(signals=(choice_signal("low", priority=20),))],
@@ -297,12 +311,16 @@ class HeartbeatEngineTests(IsolatedHomeTestCase):
         self.assertTrue(any(question_id.startswith("beta:") for question_id in question_ids))
         self.assertIsNotNone(result.candidate)
         assert result.candidate is not None
-        self.assertEqual(result.candidate.collector, "beta")
-        self.assertEqual(result.candidate.fingerprint, "high")
+        self.assertEqual(result.candidate.collector, "bundle")
+        self.assertEqual(result.candidate.fingerprint, "tick")
+        self.assertEqual(result.candidate.action.name, "bundle")
         self.assertEqual(result.candidate.action.priority, 80)
-        self.assertEqual(result.candidate.decision["source"], "typesafe")
+        self.assertEqual(observation_ids(result), [("beta", "high"), ("alpha", "low")])
+        self.assertEqual(result.state["pending"], {})
+        self.assertIn("beta:high", result.state["delivered"])
+        self.assertIn("alpha:low", result.state["delivered"])
 
-    def test_mixed_rules_and_semantic_signals_share_ranking(self) -> None:
+    def test_mixed_rules_and_semantic_signals_are_packed_together(self) -> None:
         direct = FakeUseCase(
             "alpha",
             [Snapshot(), Snapshot(signals=(rule_signal("rule", priority=90),))],
@@ -332,13 +350,16 @@ class HeartbeatEngineTests(IsolatedHomeTestCase):
         )
         self.assertIsNotNone(result.candidate)
         assert result.candidate is not None
-        self.assertEqual(result.candidate.collector, "alpha")
-        self.assertEqual(result.candidate.fingerprint, "rule")
-        self.assertEqual(result.candidate.action.priority, 90)
-        self.assertEqual(result.candidate.decision, {"action": "notify", "source": "rule"})
-        self.assertIn("beta:semantic", result.state["pending"])
+        self.assertEqual(result.candidate.collector, "bundle")
+        self.assertEqual(
+            observation_ids(result),
+            [("alpha", "rule"), ("beta", "semantic")],
+        )
+        self.assertEqual(result.state["pending"], {})
+        self.assertEqual(result.state["delivered"]["alpha:rule"]["action"], "notify")
+        self.assertEqual(result.state["delivered"]["beta:semantic"]["action"], "notify")
 
-    def test_semantic_loser_is_reused_without_a_second_typesafe_call(self) -> None:
+    def test_packed_wake_stamps_every_observation_so_cooldown_applies(self) -> None:
         low_signal = choice_signal("low", priority=20)
         high_signal = choice_signal("high", priority=80)
         low = FakeUseCase(
@@ -363,15 +384,13 @@ class HeartbeatEngineTests(IsolatedHomeTestCase):
         second = engine.tick(context(), previous_state=first.state)
 
         assert first.candidate is not None
-        assert second.candidate is not None
-        self.assertEqual(first.candidate.collector, "beta")
-        self.assertIsInstance(first.state["pending"], dict)
-        self.assertIn("alpha:low", first.state["pending"])
-        self.assertEqual(second.candidate.collector, "alpha")
+        self.assertEqual(observation_ids(first), [("beta", "high"), ("alpha", "low")])
+        self.assertEqual(first.state["pending"], {})
+        self.assertIsNone(second.candidate)
         self.assertEqual(second.state["pending"], {})
         self.assertEqual(len(typesafe.calls), 1)
 
-    def test_changed_pending_facts_force_a_fresh_typesafe_call(self) -> None:
+    def test_packed_wake_does_not_reopen_a_delivered_observation_when_a_sibling_drops(self) -> None:
         low_before = choice_signal("low", priority=20, facts={"sample": 1})
         low_after = choice_signal("low", priority=20, facts={"sample": 2})
         high = choice_signal("high", priority=80)
@@ -397,13 +416,11 @@ class HeartbeatEngineTests(IsolatedHomeTestCase):
         second = engine.tick(context(), previous_state=first.state)
 
         assert first.candidate is not None
-        assert second.candidate is not None
-        self.assertEqual(first.candidate.collector, "beta")
-        self.assertEqual(second.candidate.collector, "alpha")
-        self.assertEqual(second.candidate.facts, {"sample": 2})
-        self.assertEqual(len(typesafe.calls), 2)
+        self.assertEqual(observation_ids(first), [("beta", "high"), ("alpha", "low")])
+        self.assertIsNone(second.candidate)
+        self.assertEqual(len(typesafe.calls), 1)
 
-    def test_disappeared_signal_is_removed_from_pending(self) -> None:
+    def test_delivered_observations_are_not_queued_as_pending(self) -> None:
         low = choice_signal("low", priority=20)
         high = choice_signal("high", priority=80)
         low_use_case = FakeUseCase(
@@ -427,7 +444,8 @@ class HeartbeatEngineTests(IsolatedHomeTestCase):
         first = engine.tick(context(), previous_state=baseline.state)
         second = engine.tick(context(), previous_state=first.state)
 
-        self.assertIn("alpha:low", first.state["pending"])
+        self.assertEqual(first.state["pending"], {})
+        self.assertNotIn("alpha:low", first.state["pending"])
         self.assertNotIn("alpha:low", second.state["pending"])
         self.assertEqual(len(typesafe.calls), 1)
 
@@ -824,7 +842,17 @@ class TickResultRenderingTests(IsolatedHomeTestCase):
                     "fingerprint": "care:water",
                     "action": "water",
                     "priority": 70,
-                    "inputs": {"plant": "fern"},
+                    "inputs": [
+                        {
+                            "collector": "sense",
+                            "fingerprint": "care:water",
+                            "facts": {"plant": "fern"},
+                            "decision": {
+                                "action": "water",
+                                "source": "rule",
+                            },
+                        }
+                    ],
                     "decision": {
                         "action": "water",
                         "source": "rule",
