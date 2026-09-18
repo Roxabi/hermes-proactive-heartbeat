@@ -4,6 +4,20 @@ All notable changes to this plugin are documented here. Versions follow
 [semantic versioning](https://semver.org/spec/v2.0.0.html); releases are tagged
 `proactive-heartbeats/vX.Y.Z`.
 
+## 0.1.2 — 2026-09-18
+
+### Documentation
+
+- First-tick semantics were described as "recorded without resolution", which reads as "due on the next tick". The actual behavior — verified on a live install — is that a `baseline` signal is stamped `delivered: baseline`, which **starts the cooldown clock**: it can only wake one cooldown later (4 h by default). A fingerprint that first appears on any later tick has no delivery record and is due immediately.
+- `Cooldown` now states that it also applies to a baseline stamp, and that `repeat_after_seconds: 0` means "due on every tick while active".
+- Collector guidance is explicit: anything that must not sit unreported for a cooldown window belongs in `initial_observation="eligible"`.
+
+### Tests
+
+- Added coverage for a signal already active at the baseline tick: silent at the stamp, still silent one second before the cooldown elapses, due exactly when it does. The existing cooldown tests all introduced their signal after the baseline tick, so this timing path was unpinned.
+
+No runtime change: the engine behaves exactly as in 0.1.1.
+
 ## 0.1.1 — 2026-09-18
 
 ### Fixed

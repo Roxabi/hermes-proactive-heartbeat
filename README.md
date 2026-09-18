@@ -69,8 +69,9 @@ These names are the contract: they are identical in the code, the JSON keys, the
 
 | Term | Meaning |
 | --- | --- |
-| **Initial observation** | Per-signal first-tick policy. `"baseline"` (default) records a newly seen fingerprint without resolving it; `"eligible"` resolves it immediately, so a critical condition can wake on tick 1. |
-| **Cooldown** | `repeat_after_seconds` per signal, or root `default_cooldown_seconds`: how long an already-delivered fingerprint stays quiet. |
+| **Initial observation** | Policy for the heartbeat's **very first tick**, when no state exists yet. `"baseline"` (default) records the fingerprint and stamps it as if it had just been delivered, so the whole pre-existing backlog stays quiet; `"eligible"` resolves it immediately, so a critical condition can wake on tick 1. |
+| **Baseline stamp** | What `"baseline"` writes: a `delivered` entry with action `baseline`. It starts the cooldown clock, so such a fingerprint re-raises one **cooldown** later — not on the next tick. A fingerprint that first appears on any later tick is never baselined and is due at once. |
+| **Cooldown** | `repeat_after_seconds` per signal, or root `default_cooldown_seconds` (4 h): how long a fingerprint stays quiet after a delivery or a baseline stamp. `repeat_after_seconds: 0` means "due on every tick while active". |
 | **Pending decision** | A resolved-but-undelivered decision kept in state under `{collector}:{fingerprint}` with a `facts_digest`. Unchanged facts reuse it with no second model call; changed facts are resolved again; a disappeared signal drops it. |
 
 The cardinality is: **one plugin → many heartbeats → many collectors → many signals → at most one candidate per tick**. Collector code is reusable, while delivery, context, deduplication, and state stay isolated per heartbeat.
@@ -299,7 +300,7 @@ hermes proactive-heartbeats doctor
 hermes proactive-heartbeats tick --name care
 ```
 
-By default, a newly observed fingerprint uses `initial_observation="baseline"` and is recorded without resolution. This example explicitly uses `"eligible"`, so its signal is due on first observation and can produce a `heartbeat_candidate`; collector failures print a diagnostic to stderr and exit non-zero.
+On a heartbeat's first tick, a default `initial_observation="baseline"` signal is only recorded — and it then waits one cooldown before it can wake. This example uses `"eligible"`, so its signal is due on that first observation and can produce a `heartbeat_candidate` right away; collector failures print a diagnostic to stderr and exit non-zero.
 
 Optional TypeSafe key (direct rules remain deterministic, and semantic decisions use their configured fallback without it):
 
@@ -331,13 +332,14 @@ Wake ticks print one compact JSON object with `heartbeat_candidate` (no `wakeAge
 
 ## Tick semantics
 
-- **Initial observation** defaults to `"baseline"`: a newly observed active fingerprint is stored without resolution. A signal with `initial_observation="eligible"` is due and resolved on that first observation.
+- **The first tick of a heartbeat baselines it.** With no prior state, every active fingerprint is recorded and stamped `delivered: baseline` instead of being resolved, so an existing backlog never floods the first wake. Because the stamp starts the cooldown clock, those fingerprints re-raise one cooldown later (4 h by default), **not** on the next tick. Opt a signal out with `initial_observation="eligible"` — that is the right choice for conditions that must not wait, and it is what the bundled example uses.
+- **Later arrivals never wait.** A fingerprint first seen on any tick after the first has no delivery record, so it is due immediately. Set `repeat_after_seconds` per signal to control how often it repeats while it stays active (`0` = every tick).
 - **Deterministic decisions** resolve directly with source `rule` and never enter TypeSafe. A direct non-waking action remains active, stamps its silent/cooldown state, and yields no candidate.
 - **Pending decisions** are reused without TypeSafe while the signal remains active with unchanged facts. Changed facts are resolved again, and a disappeared signal is dropped; current context is used when a cached candidate is reconstructed.
 - **Semantic decisions** alone enter the TypeSafe batch. Mapped answers use source `typesafe`; malformed, unmapped, or unavailable answers use the configured action with source `fallback`.
 - **Soft diagnostics** stay in collector state; hard collector exceptions or invalid return types fail the tick.
 - **Winner selection** is deterministic: highest `priority`, then collector id, then fingerprint. A semantic decision never outranks a rule by virtue of being semantic.
-- **Heartbeat state** is versioned (`STATE_VERSION = 2`). A record written by another version is discarded rather than migrated, so the next tick re-baselines instead of acting on a stale shape.
+- **Heartbeat state** is versioned (`STATE_VERSION = 2`). A record written by another version is discarded rather than migrated — the next tick therefore baselines again, and already-known conditions stay quiet for one cooldown.
 
 ## Architecture
 
@@ -353,7 +355,7 @@ Durable plugin state lives under `$HERMES_HOME/plugin-data/` via `ctx.state`. Se
 
 1. Write `$HERMES_HOME/proactive-heartbeats/collectors/{id}.py` with a `Collector` (or any class with `collect()` and matching `id`).
 2. Emit stable fingerprints and compact facts. Set `decision` to a direct `ActionSpec` rule or a `JudgmentSpec` that maps semantic labels to trusted actions.
-3. Choose whether a newly observed fingerprint uses the default `initial_observation="baseline"` or opts into first-observation resolution with `"eligible"`.
+3. Decide what the signal should do on a heartbeat's very first tick: the default `initial_observation="baseline"` records it and defers it by one cooldown, while `"eligible"` lets it wake immediately. Anything that must not sit unreported for a cooldown window belongs in `"eligible"`.
 4. Enable it from a heartbeat JSON: `collectors.{id}.enabled: true`.
 5. Run `hermes proactive-heartbeats doctor` then one `tick --name …`.
 
