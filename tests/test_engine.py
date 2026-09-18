@@ -501,6 +501,30 @@ class HeartbeatEngineTests(IsolatedHomeTestCase):
         self.assertEqual(result.candidate.fingerprint, "disk:root")
         self.assertEqual(len(typesafe.calls), 2)
 
+    def test_signal_present_at_the_baseline_tick_waits_one_cooldown(self) -> None:
+        snapshot = Snapshot(signals=(rule_signal("disk:root", priority=70),), state={"sample": 1})
+        engine = HeartbeatEngine(
+            [FakeUseCase("host", [snapshot, snapshot, snapshot])],
+            typesafe=FakeTypeSafe({}),
+        )
+
+        baseline = engine.tick(context(), previous_state=None)
+        inside = engine.tick(
+            context(now=NOW + timedelta(seconds=14_399)),
+            previous_state=baseline.state,
+        )
+        elapsed = engine.tick(
+            context(now=NOW + timedelta(seconds=14_400)),
+            previous_state=inside.state,
+        )
+
+        self.assertIsNone(baseline.candidate)
+        self.assertIsNone(inside.candidate)
+        self.assertIsNotNone(elapsed.candidate)
+        assert elapsed.candidate is not None
+        self.assertEqual(elapsed.candidate.fingerprint, "disk:root")
+        self.assertEqual(elapsed.candidate.decision["source"], "rule")
+
     def test_active_signal_without_a_delivery_record_stays_eligible(self) -> None:
         signal = choice_signal("disk:root", fallback_label="notify")
         previous = {
