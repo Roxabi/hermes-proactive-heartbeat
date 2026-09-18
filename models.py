@@ -90,10 +90,20 @@ class Candidate:
 
 @dataclass(frozen=True)
 class TickContext:
-    """Read-only context shared by every use case during one tick."""
+    """Read-only context for one tick, narrowed to the use case being invoked.
+
+    `delivered` maps that use case's own fingerprints — never another use
+    case's — to the delivery record persisted before this tick:
+    `{"at": "<iso8601>", "action": "<action name>"}`. Action `baseline` means
+    the fingerprint was only baselined, `silent` that it was due but did not
+    wake the agent; any other name is the action that actually woke it. So
+    `baseline` and `silent` were never announced to the user, and a first tick
+    sees an empty mapping.
+    """
 
     now: datetime
     settings: JsonObject
+    delivered: JsonObject = field(default_factory=dict)
 
 
 class HeartbeatUseCase(Protocol):

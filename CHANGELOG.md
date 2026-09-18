@@ -4,6 +4,16 @@ All notable changes to this plugin are documented here. Versions follow
 [semantic versioning](https://semver.org/spec/v2.0.0.html); releases are tagged
 `proactive-heartbeats/vX.Y.Z`.
 
+## 0.2.0 — 2026-09-18
+
+### Added
+
+- `TickContext.delivered`: the delivery records the engine persisted for **the collector being invoked**, keyed by its own fingerprints with no `{collector}:` prefix, each holding `{"at": "<iso8601>", "action": "<action name>"}`. A collector could see what it observed, never what the engine actually announced: a signal stamped `silent` because a higher-priority signal won the tick was indistinguishable from one that really woke the agent. Digest and delta collectors need that difference — "list everything once a day, otherwise only what is new" is not implementable without it. Action `baseline` means the fingerprint was only baselined and `silent` that it was due but did not wake the agent, so both mean "not announced to the user"; any other name is the action that woke it. A collector never sees a sibling collector's fingerprints, and the first tick sees `{}`.
+
+### Migration
+
+- No collector change is required. Collectors that construct a `TickContext` themselves — tests, harnesses — get the new field by default (an empty mapping), and `collect()` keeps its signature. The persisted state schema, `STATE_VERSION`, the gates, and the stdout contract are untouched.
+
 ## 0.1.2 — 2026-09-18
 
 ### Documentation
