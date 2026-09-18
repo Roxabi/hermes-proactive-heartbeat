@@ -1,6 +1,12 @@
 # hermes-proactive-heartbeats
 
-Native Hermes plugin for named proactive heartbeats: collectors emit signals with explicit deterministic actions or semantic judgments, optional TypeSafe resolves only semantic decisions, and Hermes Cron owns scheduling, the `wakeAgent` gate, and delivery. One plugin, many heartbeats — each with its own JSON, cron job, shim, and persisted state.
+A cron that wakes an LLM just to be told "nothing to do" is the most expensive way to learn nothing. This plugin moves that verdict **before** the model call: every tick collects facts in plain Python, gates them deterministically, and wakes a Hermes agent only when something changed *and* that change is worth an interruption.
+
+- **Nothing to report** → the tick prints exactly `{"wakeAgent": false}`. No agent, no prompt, no tokens.
+- **Something to report** → the tick prints one `heartbeat_candidate`: the compact facts plus the action already selected. The woken agent writes the message; it does not re-decide whether to speak.
+- **Most signals never need a model at all.** A disk threshold, a failed unit, or an open critical CVE is a deterministic **rule** (`ActionSpec`) resolved in-process. Only genuinely judgment-shaped signals ("is this still worth a poke?") become a **semantic decision** (`JudgmentSpec`), and those are batched into at most one optional TypeSafe call per tick.
+
+So the cost of watching stays "a cron running Python", and model cost is paid only on the ticks that earned it.
 
 ## What this plugin provides
 
@@ -15,19 +21,58 @@ This plugin turns Hermes Cron into a set of named, stateful proactive pipelines.
 
 The plugin does not ship operator-specific collectors or run its own scheduler. Hermes Cron owns scheduling and delivery; this plugin owns collection, eligibility, decision resolution, candidate selection, and persisted heartbeat state.
 
-## Terminology
+## Documentation map
+
+| File | Read it for |
+| --- | --- |
+| `README.md` | value, vocabulary, runtime flow, configuration, operator commands (this file) |
+| [after-install.md](after-install.md) | the checklist Hermes prints right after `hermes plugins install` |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | dev setup, quality gates, repository boundary, PR expectations |
+| [AGENTS.md](AGENTS.md) | the binding contract for any agent or contributor editing this repository |
+| [.dev/stack.yml](.dev/stack.yml) | machine-readable format / lint / typecheck / test commands |
+
+## Ubiquitous language
+
+These names are the contract: they are identical in the code, the JSON keys, the persisted state, and the wake payload. Extend the plugin by reusing a term below — or by adding the term here first.
+
+### Pipeline
 
 | Term | Meaning |
 | --- | --- |
-| **Plugin** | The generic runtime declared by `plugin.yaml`, installed and enabled by Hermes. One plugin instance can serve many heartbeats. |
-| **Heartbeat** | A named proactive pipeline declared by one `heartbeats/{name}.json` file. It has one managed cron job, one generated shim, and one independent state key. |
-| **Collector** | An operator-owned Python module at `collectors/{id}.py`. Its `Collector` class observes one source and returns a snapshot. The same collector can be enabled by several heartbeats. |
-| **Snapshot** | One collector result: current signals, collector state for the next tick, and optional soft diagnostics. |
-| **Signal** | An observation with a stable fingerprint, compact facts, and a `decision`: either a deterministic `ActionSpec` or semantic `JudgmentSpec`. |
+| **Plugin** | The generic runtime declared by `plugin.yaml`, installed and enabled by Hermes. One plugin instance serves many heartbeats. |
+| **Heartbeat** | A named proactive pipeline declared by one `heartbeats/{name}.json` file. It owns one managed cron job, one generated shim, and one independent state key. |
+| **Collector** | An operator-owned Python module at `collectors/{id}.py`. Its `Collector` class observes one source and returns a snapshot. Several heartbeats may enable the same collector with different configuration. |
+| **Snapshot** | One collector result: the currently active signals, the collector state to persist for the next tick, and optional soft diagnostics. |
+| **Signal** | One currently active condition: a stable `fingerprint`, compact `facts`, and a `decision`. |
+| **Fingerprint** | The stable identity of a condition (`pr:repo#12`, `disk:m1`). It is the dedupe key: the same fingerprint is the same condition, not a new one. |
+| **Facts** | The small bounded JSON payload describing the condition — and the only material the woken agent should mention. |
 | **Tick** | One `collect → gate → decide → select → render` cycle for one heartbeat. |
-| **Candidate** | The single selected wake payload for a tick. Without a candidate, stdout is exactly `{"wakeAgent": false}`. |
+| **Candidate** | The single resolved signal selected for one agent wake. |
+| **Quiet tick** | A tick with no candidate. Its stdout is exactly `{"wakeAgent": false}`. |
+| **Shim** | The `scripts/proactive-heartbeats-{name}.sh` file generated by `setup`. The cron job runs the shim; the shim runs `tick --name {name}`. |
+| **Heartbeat state** | The per-heartbeat persisted record (`heartbeat:{name}` in `ctx.state`) holding collector state, active fingerprints, delivery stamps, and pending decisions. Schema `STATE_VERSION = 2`; a record of another version is discarded, never migrated. |
 
-The cardinality is: **one plugin → many heartbeats → many collectors → many signals**. Collector code is reusable, while delivery, context, deduplication, and state remain isolated per heartbeat.
+### Deciding
+
+| Term | Meaning |
+| --- | --- |
+| **Decision** | A signal's `decision` field: exactly one of a rule or a semantic decision. There is no dual form and no legacy alias. |
+| **Rule** — `ActionSpec` | A deterministic decision resolved in-process. Requires `name`, an explicit `wake_agent` boolean, and `priority`; `instruction` and `max_sentences` shape the message. Never reaches TypeSafe. |
+| **Semantic decision** — `JudgmentSpec` | A TypeSafe `question`, an `actions` map from answer label to trusted `ActionSpec`, and a `fallback_label`. The model picks a label; it never invents an action. |
+| **`wake_agent`** | Whether the selected action wakes an agent. `SILENT`, exported by the SDK, is the canonical non-waking action — do not define another one. |
+| **Priority** | Integer ranking used to pick the winner among resolved candidates: highest `priority` first, then collector id, then fingerprint. Deterministic, and never influenced by the decision source. |
+| **Source** | Provenance stamped on the wake payload: `rule` (deterministic), `typesafe` (mapped model answer), `fallback` (model unavailable, malformed, or unmapped answer). |
+| **Threshold** | `typesafe_threshold`: the probability above which a boolean-shaped semantic answer counts as "yes". |
+
+### Gating
+
+| Term | Meaning |
+| --- | --- |
+| **Initial observation** | Per-signal first-tick policy. `"baseline"` (default) records a newly seen fingerprint without resolving it; `"eligible"` resolves it immediately, so a critical condition can wake on tick 1. |
+| **Cooldown** | `repeat_after_seconds` per signal, or root `default_cooldown_seconds`: how long an already-delivered fingerprint stays quiet. |
+| **Pending decision** | A resolved-but-undelivered decision kept in state under `{collector}:{fingerprint}` with a `facts_digest`. Unchanged facts reuse it with no second model call; changed facts are resolved again; a disappeared signal drops it. |
+
+The cardinality is: **one plugin → many heartbeats → many collectors → many signals → at most one candidate per tick**. Collector code is reusable, while delivery, context, deduplication, and state stay isolated per heartbeat.
 
 ## Runtime flow
 
@@ -45,14 +90,18 @@ The installed plugin checkout is generic code managed by Hermes:
 
 ```text
 <plugin checkout>/
-├── plugin.yaml          # Hermes plugin manifest
-├── __init__.py          # registration only
+├── plugin.yaml          # Hermes plugin manifest: version, config schema, optional env
+├── __init__.py          # register(ctx) — registration only, no loops, no writes
+├── _bootstrap.py        # makes the checkout importable for flat and package loads
 ├── cli.py               # setup, tick, status, doctor
-├── config.py            # root + heartbeat configuration loading
+├── config.py            # root + per-heartbeat configuration loading and merge
 ├── registry.py          # operator collector discovery
-├── engine.py            # gates, semantic batch, dedupe, selection
-├── models.py            # collector SDK contracts
-└── collector_exec.py    # optional local-command / SSH helpers
+├── engine.py            # gates, decision resolution, semantic batch, dedupe, selection
+├── models.py            # collector SDK contracts (ActionSpec, SILENT, JudgmentSpec, Signal, …)
+├── typesafe.py          # optional TypeSafe System One HTTP client
+├── collector_exec.py    # optional local-command / SSH helpers for collectors
+├── setup.py             # idempotent shim + Hermes cron reconciliation
+└── tests/               # unittest suite: engine gates, config, registry, setup, plugin tick
 ```
 
 Operator-owned configuration and collectors live under the active `HERMES_HOME`, not in the plugin checkout:
@@ -267,13 +316,15 @@ Silent ticks print exactly:
 
 Wake ticks print one compact JSON object with `heartbeat_candidate` (no `wakeAgent` line). Hermes Cron reads that stdout contract.
 
-### Tick semantics (short)
+## Tick semantics
 
 - **Initial observation** defaults to `"baseline"`: a newly observed active fingerprint is stored without resolution. A signal with `initial_observation="eligible"` is due and resolved on that first observation.
 - **Deterministic decisions** resolve directly with source `rule` and never enter TypeSafe. A direct non-waking action remains active, stamps its silent/cooldown state, and yields no candidate.
 - **Pending decisions** are reused without TypeSafe while the signal remains active with unchanged facts. Changed facts are resolved again, and a disappeared signal is dropped; current context is used when a cached candidate is reconstructed.
 - **Semantic decisions** alone enter the TypeSafe batch. Mapped answers use source `typesafe`; malformed, unmapped, or unavailable answers use the configured action with source `fallback`.
 - **Soft diagnostics** stay in collector state; hard collector exceptions or invalid return types fail the tick.
+- **Winner selection** is deterministic: highest `priority`, then collector id, then fingerprint. A semantic decision never outranks a rule by virtue of being semantic.
+- **Heartbeat state** is versioned (`STATE_VERSION = 2`). A record written by another version is discarded rather than migrated, so the next tick re-baselines instead of acting on a stale shape.
 
 ## Architecture
 
@@ -301,4 +352,4 @@ hermes cron remove proactive-heartbeats-<name>   # per heartbeat
 # optional: hermes plugins uninstall proactive-heartbeats
 ```
 
-See [after-install.md](after-install.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
+Contract and process: [AGENTS.md](AGENTS.md) · [CONTRIBUTING.md](CONTRIBUTING.md) · [after-install.md](after-install.md).
