@@ -132,15 +132,15 @@ For `heartbeats/care.json`, `setup` manages the cron job `proactive-heartbeats-c
 
 ## Install
 
-`hermes plugins install --ref` accepts **only a full 40-character commit SHA** — a tag or branch name is rejected. Releases are tagged `proactive-heartbeats/vX.Y.Z`, so pick a release and resolve its tag to a commit first:
+`hermes plugins install --ref` accepts **only a full 40-character commit SHA** — a tag or branch name is rejected. Releases are tagged `proactive-heartbeats/vX.Y.Z`, so pick a release, resolve its tag to a commit, then pin that commit. Each release's notes also state the SHA outright.
 
 ```bash
 # resolve the release tag to its commit (^{} peels the annotated tag; without it
 # ls-remote returns the tag object SHA, which is not a commit)
-git ls-remote https://github.com/Roxabi/hermes-proactive-heartbeats.git 'proactive-heartbeats/v0.1.0^{}'
-# or: gh api repos/Roxabi/hermes-proactive-heartbeats/commits/proactive-heartbeats/v0.1.0 --jq .sha
+git ls-remote https://github.com/Roxabi/hermes-proactive-heartbeats.git 'proactive-heartbeats/v0.1.1^{}'
+# or: gh api repos/Roxabi/hermes-proactive-heartbeats/commits/proactive-heartbeats/v0.1.1 --jq .sha
 
-hermes plugins install Roxabi/hermes-proactive-heartbeats --ref a9a5d883135df15ee609c98aaffe4ab37feb0372
+hermes plugins install Roxabi/hermes-proactive-heartbeats --ref <40-char-sha>
 hermes plugins enable proactive-heartbeats
 hermes proactive-heartbeats setup
 ```
