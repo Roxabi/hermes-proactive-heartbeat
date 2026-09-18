@@ -3,7 +3,7 @@ version: 0.0.1
 manifest_version: 1
 api_version: 1
 kind: standalone
-description: Extensible proactive heartbeats for Hermes with named crons, deterministic rules, and optional TypeSafe semantic decisions.
+description: Proactive heartbeats for Hermes that decide before the model call — deterministic rules and optional batched TypeSafe judgments, so a tick with nothing to report costs no LLM wake.
 author: Roxabi
 license: MIT
 homepage: https://github.com/Roxabi/hermes-proactive-heartbeats

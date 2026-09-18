@@ -2,6 +2,8 @@
 
 Public native Hermes plugin. Keep the runtime generic: hostnames, repositories, channels, personal paths, and secrets belong under the active `HERMES_HOME`, never in this repository.
 
+Naming is fixed by README § *Ubiquitous language*. Reuse those terms in code, JSON keys, persisted state, and wake payloads — or amend that section in the same change.
+
 ## Runtime boundaries
 
 - Hermes Cron owns scheduling, the `wakeAgent` script gate, and delivery — one cron job per named heartbeat file.
@@ -10,6 +12,7 @@ Public native Hermes plugin. Keep the runtime generic: hostnames, repositories, 
 - `register(ctx)` only registers surfaces; setup and filesystem writes happen through explicit CLI commands.
 - A quiet tick ends with the exact standalone line `{"wakeAgent": false}`.
 - Operator config lives under `$HERMES_HOME/proactive-heartbeats/`.
+- Deterministic rules resolve without a model; only semantic decisions may reach TypeSafe, batched once per tick. A tick that has nothing to report must cost no model call.
 
 ## Quality
 
