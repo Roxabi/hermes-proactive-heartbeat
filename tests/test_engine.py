@@ -18,9 +18,11 @@ class FakeUseCase:
         self.id = use_case_id
         self._snapshots = iter(snapshots)
         self.previous_states: list[dict[str, Any]] = []
+        self.delivered_views: list[dict[str, Any]] = []
 
     def collect(self, context: TickContext, previous_state: dict[str, Any]) -> Snapshot:
         self.previous_states.append(previous_state)
+        self.delivered_views.append(dict(context.delivered))
         result = next(self._snapshots)
         if isinstance(result, Exception):
             raise result
@@ -568,6 +570,96 @@ class HeartbeatEngineTests(IsolatedHomeTestCase):
         self.assertIsNotNone(due.candidate)
         assert due.candidate is not None
         self.assertEqual(due.candidate.fingerprint, "disk:root")
+
+    def test_collector_sees_the_action_that_actually_woke_the_agent(self) -> None:
+        snapshot = Snapshot(signals=(rule_signal("disk:root", priority=70),))
+        use_case = FakeUseCase("host", [Snapshot(), snapshot, snapshot])
+        engine = HeartbeatEngine([use_case], typesafe=FakeTypeSafe({}))
+        baseline = engine.tick(context(), previous_state=None)
+        woken = engine.tick(context(), previous_state=baseline.state)
+
+        engine.tick(context(), previous_state=woken.state)
+
+        assert woken.candidate is not None
+        self.assertEqual(woken.candidate.action.name, "notify")
+        self.assertEqual(use_case.delivered_views[0], {})
+        self.assertEqual(use_case.delivered_views[1], {})
+        self.assertEqual(
+            use_case.delivered_views[2],
+            {"disk:root": {"at": "2026-09-17T12:00:00Z", "action": "notify"}},
+        )
+
+    def test_due_signal_that_lost_the_tick_is_visible_as_silent(self) -> None:
+        quiet = FakeUseCase(
+            "alpha",
+            [Snapshot(), Snapshot(signals=(choice_signal("low", priority=20),)), Snapshot()],
+        )
+        loud = FakeUseCase(
+            "beta",
+            [Snapshot(), Snapshot(signals=(rule_signal("high", priority=80),)), Snapshot()],
+        )
+
+        def answer_silent(questions: Any) -> dict[str, Any]:
+            return {
+                question_id: choice_answer("silent")
+                for question_id, _question in question_items(questions)
+            }
+
+        engine = HeartbeatEngine([quiet, loud], typesafe=FakeTypeSafe(answer_silent))
+        baseline = engine.tick(context(), previous_state=None)
+        first = engine.tick(context(), previous_state=baseline.state)
+
+        engine.tick(context(), previous_state=first.state)
+
+        assert first.candidate is not None
+        self.assertEqual(first.candidate.collector, "beta")
+        self.assertEqual(
+            loud.delivered_views[2],
+            {"high": {"at": "2026-09-17T12:00:00Z", "action": "notify"}},
+        )
+        self.assertEqual(
+            quiet.delivered_views[2],
+            {"low": {"at": "2026-09-17T12:00:00Z", "action": "silent"}},
+        )
+
+    def test_baselined_fingerprint_is_visible_as_baseline(self) -> None:
+        snapshot = Snapshot(signals=(choice_signal("disk:root"),))
+        use_case = FakeUseCase("host", [snapshot, snapshot])
+        engine = HeartbeatEngine([use_case], typesafe=FakeTypeSafe({}))
+        baseline = engine.tick(context(), previous_state=None)
+
+        engine.tick(context(), previous_state=baseline.state)
+
+        self.assertEqual(
+            use_case.delivered_views,
+            [
+                {},
+                {"disk:root": {"at": "2026-09-17T12:00:00Z", "action": "baseline"}},
+            ],
+        )
+
+    def test_collector_never_sees_a_sibling_collectors_fingerprints(self) -> None:
+        alpha = FakeUseCase(
+            "alpha",
+            [Snapshot(signals=(rule_signal("cve:repo:pkg"),)), Snapshot()],
+        )
+        beta = FakeUseCase(
+            "beta",
+            [Snapshot(signals=(rule_signal("beta:cve:repo:pkg"),)), Snapshot()],
+        )
+        engine = HeartbeatEngine([alpha, beta], typesafe=FakeTypeSafe({}))
+
+        baseline = engine.tick(context(), previous_state=None)
+        engine.tick(context(), previous_state=baseline.state)
+
+        self.assertEqual(
+            alpha.delivered_views[1],
+            {"cve:repo:pkg": {"at": "2026-09-17T12:00:00Z", "action": "baseline"}},
+        )
+        self.assertEqual(
+            beta.delivered_views[1],
+            {"beta:cve:repo:pkg": {"at": "2026-09-17T12:00:00Z", "action": "baseline"}},
+        )
 
 
 class TickResultRenderingTests(IsolatedHomeTestCase):

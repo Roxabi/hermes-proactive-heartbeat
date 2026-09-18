@@ -73,6 +73,7 @@ These names are the contract: they are identical in the code, the JSON keys, the
 | **Baseline stamp** | What `"baseline"` writes: a `delivered` entry with action `baseline`. It starts the cooldown clock, so such a fingerprint re-raises one **cooldown** later — not on the next tick. A fingerprint that first appears on any later tick is never baselined and is due at once. |
 | **Cooldown** | `repeat_after_seconds` per signal, or root `default_cooldown_seconds` (4 h): how long a fingerprint stays quiet after a delivery or a baseline stamp. `repeat_after_seconds: 0` means "due on every tick while active". |
 | **Pending decision** | A resolved-but-undelivered decision kept in state under `{collector}:{fingerprint}` with a `facts_digest`. Unchanged facts reuse it with no second model call; changed facts are resolved again; a disappeared signal drops it. |
+| **Delivery record view** | `context.delivered`: what the engine really announced for **the collector being invoked**, keyed by that collector's own fingerprints with no `{collector}:` prefix, each holding `{"at": "<iso8601>", "action": "<action name>"}` as persisted before this tick. Action `baseline` means the fingerprint was only baselined, `silent` that it was due but did not wake the agent — neither is an announcement to the user; any other name is the action that woke it. A collector never sees a sibling collector's fingerprints, and the first tick sees `{}`. |
 
 The cardinality is: **one plugin → many heartbeats → many collectors → many signals → at most one candidate per tick**. Collector code is reusable, while delivery, context, deduplication, and state stay isolated per heartbeat.
 
@@ -336,6 +337,7 @@ Wake ticks print one compact JSON object with `heartbeat_candidate` (no `wakeAge
 - **Later arrivals never wait.** A fingerprint first seen on any tick after the first has no delivery record, so it is due immediately. Set `repeat_after_seconds` per signal to control how often it repeats while it stays active (`0` = every tick).
 - **Deterministic decisions** resolve directly with source `rule` and never enter TypeSafe. A direct non-waking action remains active, stamps its silent/cooldown state, and yields no candidate.
 - **Pending decisions** are reused without TypeSafe while the signal remains active with unchanged facts. Changed facts are resolved again, and a disappeared signal is dropped; current context is used when a cached candidate is reconstructed.
+- **A collector reads its own delivery records.** `context.delivered` carries the records persisted for that collector's fingerprints before this tick, so `collect()` can tell what was actually announced. Actions `baseline` and `silent` are not announcements — the signal was baselined, or due but beaten to the tick — which is what makes digest and delta collectors possible.
 - **Semantic decisions** alone enter the TypeSafe batch. Mapped answers use source `typesafe`; malformed, unmapped, or unavailable answers use the configured action with source `fallback`.
 - **Soft diagnostics** stay in collector state; hard collector exceptions or invalid return types fail the tick.
 - **Winner selection** is deterministic: highest `priority`, then collector id, then fingerprint. A semantic decision never outranks a rule by virtue of being semantic.
@@ -356,8 +358,9 @@ Durable plugin state lives under `$HERMES_HOME/plugin-data/` via `ctx.state`. Se
 1. Write `$HERMES_HOME/proactive-heartbeats/collectors/{id}.py` with a `Collector` (or any class with `collect()` and matching `id`).
 2. Emit stable fingerprints and compact facts. Set `decision` to a direct `ActionSpec` rule or a `JudgmentSpec` that maps semantic labels to trusted actions.
 3. Decide what the signal should do on a heartbeat's very first tick: the default `initial_observation="baseline"` records it and defers it by one cooldown, while `"eligible"` lets it wake immediately. Anything that must not sit unreported for a cooldown window belongs in `"eligible"`.
-4. Enable it from a heartbeat JSON: `collectors.{id}.enabled: true`.
-5. Run `hermes proactive-heartbeats doctor` then one `tick --name …`.
+4. Use `context.delivered` when the collector needs to know what was already announced — a digest that lists everything once a day and only the new items otherwise reads the recorded `action`, treating `baseline` and `silent` as "never announced".
+5. Enable it from a heartbeat JSON: `collectors.{id}.enabled: true`.
+6. Run `hermes proactive-heartbeats doctor` then one `tick --name …`.
 
 ## Remove
 

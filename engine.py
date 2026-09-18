@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
@@ -101,8 +101,15 @@ class HeartbeatEngine:
 
         for use_case in self.use_cases:
             previous_entry = _use_case_entry(previous_root, use_case.id)
+            collector_context = replace(
+                context,
+                delivered=_delivered_view(previous_root.get("delivered"), use_case.id),
+            )
             try:
-                snapshot = use_case.collect(context, dict(previous_entry.get("state") or {}))
+                snapshot = use_case.collect(
+                    collector_context,
+                    dict(previous_entry.get("state") or {}),
+                )
             except Exception as exc:  # noqa: BLE001 - isolate per use case
                 diagnostics[use_case.id] = {
                     "error": exc.__class__.__name__,
@@ -400,6 +407,17 @@ def _question_id(use_case_id: str, fingerprint: str) -> str:
 
 def _delivery_key(use_case_id: str, fingerprint: str) -> str:
     return f"{use_case_id}:{fingerprint}"
+
+
+def _delivered_view(delivered: Any, use_case_id: str) -> JsonObject:
+    if not isinstance(delivered, Mapping):
+        return {}
+    prefix = _delivery_key(use_case_id, "")
+    return {
+        key[len(prefix) :]: dict(record)
+        for key, record in delivered.items()
+        if isinstance(key, str) and key.startswith(prefix) and isinstance(record, Mapping)
+    }
 
 
 def _is_due(
