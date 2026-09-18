@@ -27,6 +27,7 @@ The plugin does not ship operator-specific collectors or run its own scheduler. 
 | --- | --- |
 | `README.md` | value, vocabulary, runtime flow, configuration, operator commands (this file) |
 | [after-install.md](after-install.md) | the checklist Hermes prints right after `hermes plugins install` |
+| [CHANGELOG.md](CHANGELOG.md) | what each released version changed, and the version to pin |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | dev setup, quality gates, repository boundary, PR expectations |
 | [AGENTS.md](AGENTS.md) | the binding contract for any agent or contributor editing this repository |
 | [.dev/stack.yml](.dev/stack.yml) | machine-readable format / lint / typecheck / test commands |
@@ -131,16 +132,21 @@ For `heartbeats/care.json`, `setup` manages the cron job `proactive-heartbeats-c
 
 ## Install
 
-Pin an exact full-length commit SHA (not a branch name):
+Pin an immutable ref — a release tag, or an exact full-length commit SHA. Never a branch name.
 
 ```bash
-# discover a pin
+hermes plugins install Roxabi/hermes-proactive-heartbeats --ref proactive-heartbeats/v0.1.0
+hermes plugins enable proactive-heartbeats
+hermes proactive-heartbeats setup
+```
+
+Releases are tagged `proactive-heartbeats/vX.Y.Z`. To ride an unreleased commit instead, pin its SHA:
+
+```bash
 git ls-remote https://github.com/Roxabi/hermes-proactive-heartbeats.git HEAD
 # or: gh api repos/Roxabi/hermes-proactive-heartbeats/commits/main --jq .sha
 
 hermes plugins install Roxabi/hermes-proactive-heartbeats --ref <40-char-sha>
-hermes plugins enable proactive-heartbeats
-hermes proactive-heartbeats setup
 ```
 
 ## Minimal end-to-end example

@@ -62,8 +62,19 @@ A quiet tick must remain the exact standalone line:
 
 1. Fork the repository and create a focused branch.
 2. Keep the change generic and remove obsolete paths rather than adding compatibility shims.
-3. Update `README.md` or `after-install.md` when installation or operator behavior changes.
+3. Update `README.md` or `after-install.md` when installation or operator behavior changes, and add a `CHANGELOG.md` entry when behavior visible to an operator changes.
 4. Run all quality gates above.
 5. Explain the user-visible behavior and verification in the pull request.
+
+## Releases
+
+A release is a tag plus a GitHub release; there is no publishing step and no release automation.
+
+1. Land every change through a PR — `main` is frozen against direct pushes.
+2. In one release PR, bump `version:` in `plugin.yaml` and add the matching `CHANGELOG.md` section.
+3. After CI is green and the PR is merged with a merge commit, tag that merge commit `proactive-heartbeats/vX.Y.Z` and create the GitHub release from the changelog section.
+4. Operators pin the tag: `hermes plugins install Roxabi/hermes-proactive-heartbeats --ref proactive-heartbeats/vX.Y.Z`.
+
+`plugin.yaml` `version`, the changelog heading, and the tag must agree.
 
 By contributing, you agree that your contribution is licensed under the repository's MIT license.
