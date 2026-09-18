@@ -132,15 +132,20 @@ For `heartbeats/care.json`, `setup` manages the cron job `proactive-heartbeats-c
 
 ## Install
 
-Pin an immutable ref — a release tag, or an exact full-length commit SHA. Never a branch name.
+`hermes plugins install --ref` accepts **only a full 40-character commit SHA** — a tag or branch name is rejected. Releases are tagged `proactive-heartbeats/vX.Y.Z`, so pick a release and resolve its tag to a commit first:
 
 ```bash
-hermes plugins install Roxabi/hermes-proactive-heartbeats --ref proactive-heartbeats/v0.1.0
+# resolve the release tag to its commit (^{} peels the annotated tag; without it
+# ls-remote returns the tag object SHA, which is not a commit)
+git ls-remote https://github.com/Roxabi/hermes-proactive-heartbeats.git 'proactive-heartbeats/v0.1.0^{}'
+# or: gh api repos/Roxabi/hermes-proactive-heartbeats/commits/proactive-heartbeats/v0.1.0 --jq .sha
+
+hermes plugins install Roxabi/hermes-proactive-heartbeats --ref a9a5d883135df15ee609c98aaffe4ab37feb0372
 hermes plugins enable proactive-heartbeats
 hermes proactive-heartbeats setup
 ```
 
-Releases are tagged `proactive-heartbeats/vX.Y.Z`. To ride an unreleased commit instead, pin its SHA:
+To ride an unreleased commit instead, resolve `main`:
 
 ```bash
 git ls-remote https://github.com/Roxabi/hermes-proactive-heartbeats.git HEAD
@@ -148,6 +153,8 @@ git ls-remote https://github.com/Roxabi/hermes-proactive-heartbeats.git HEAD
 
 hermes plugins install Roxabi/hermes-proactive-heartbeats --ref <40-char-sha>
 ```
+
+The installed version is recorded in `$HERMES_HOME/plugins/.install-metadata.json`; `plugin.yaml` `version` in the checkout tells you which release that SHA belongs to.
 
 ## Minimal end-to-end example
 

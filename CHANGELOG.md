@@ -8,6 +8,14 @@ All notable changes to this plugin are documented here. Versions follow
 
 First tagged release. Nothing before this tag was published, so the contract below is the baseline rather than a delta.
 
+### Install
+
+`hermes plugins install --ref` takes only a 40-character commit SHA, so pin this release by its tagged commit:
+
+```bash
+hermes plugins install Roxabi/hermes-proactive-heartbeats --ref a9a5d883135df15ee609c98aaffe4ab37feb0372
+```
+
 ### Decide before the model call
 
 - A tick collects facts in plain Python, gates them deterministically, and prints exactly `{"wakeAgent": false}` when nothing is due — no agent wake, no tokens.
