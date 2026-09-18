@@ -1,5 +1,5 @@
 name: proactive-heartbeats
-version: 0.2.0
+version: 0.2.1
 manifest_version: 1
 api_version: 1
 kind: standalone

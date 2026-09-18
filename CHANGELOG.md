@@ -4,6 +4,19 @@ All notable changes to this plugin are documented here. Versions follow
 [semantic versioning](https://semver.org/spec/v2.0.0.html); releases are tagged
 `proactive-heartbeats/vX.Y.Z`.
 
+## 0.2.1 — 2026-09-18
+
+### Fixed
+
+- `delivered` in the heartbeat state only ever grew. Measured on a live install, a tick still carried records for fingerprints the collector had stopped emitting hours earlier, so every collector minting content-addressed or date-anchored fingerprints — a daily digest keyed `…:digest:{date}`, a delta keyed by a hash of the new items — added at least one permanent record per day. The engine now persists a delivery record only while its fingerprint is in that collector's active set for the tick being persisted.
+- This is a behavioral no-op by construction: `_is_due` returns `True` for a fingerprint absent from its collector's previous active set **before** it reads `delivered`, so a record for an inactive fingerprint can suppress nothing, at any age and for any `repeat_after_seconds`. Dropping it changes no decision.
+- Retention is fail-closed. A collector that failed this tick has no fresh active set, so every one of its records is kept untouched, on the fail-closed return as well as the normal one. A key that names no collector loaded by this heartbeat — a collector temporarily disabled in the heartbeat JSON, for instance — is kept too: pruning never shreds state it cannot judge.
+- Collectors that need memory outliving a fingerprint must keep it in their own `Snapshot.state`; `context.delivered` now covers the fingerprints active on the previous tick, not the whole history.
+
+### Tests
+
+- Five cases pin the observable rule: a vanished fingerprint's record is gone from the next persisted state, a still-active record survives and keeps suppressing inside its cooldown, a failed collector's records all survive, an unloaded collector's records survive, and a fingerprint containing `:` is matched to its own collector rather than split at the wrong separator.
+
 ## 0.2.0 — 2026-09-18
 
 ### Added
