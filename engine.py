@@ -233,7 +233,11 @@ class HeartbeatEngine:
                 state={
                     "version": STATE_VERSION,
                     "use_cases": next_use_cases,
-                    "delivered": delivered,
+                    "delivered": _retained_delivered(
+                        delivered,
+                        use_cases=next_use_cases,
+                        diagnostics=diagnostics,
+                    ),
                     "pending": _sorted_pending(queued),
                 },
                 diagnostics=diagnostics,
@@ -296,7 +300,11 @@ class HeartbeatEngine:
             state={
                 "version": STATE_VERSION,
                 "use_cases": next_use_cases,
-                "delivered": delivered,
+                "delivered": _retained_delivered(
+                    delivered,
+                    use_cases=next_use_cases,
+                    diagnostics=diagnostics,
+                ),
                 "pending": _sorted_pending(next_pending),
             },
             diagnostics=diagnostics,
@@ -418,6 +426,32 @@ def _delivered_view(delivered: Any, use_case_id: str) -> JsonObject:
         for key, record in delivered.items()
         if isinstance(key, str) and key.startswith(prefix) and isinstance(record, Mapping)
     }
+
+
+def _retained_delivered(
+    delivered: Mapping[str, Any],
+    *,
+    use_cases: Mapping[str, Any],
+    diagnostics: Mapping[str, Any],
+) -> JsonObject:
+    # Pruning is a no-op: `_is_due` returns True for a fingerprint absent from its collector's
+    # previous active set before it ever consults `delivered`, so such a record can suppress
+    # nothing at any age. A collector that failed this tick has no fresh active set, and a key
+    # that names no loaded collector cannot be judged — both are retained untouched.
+    retained: JsonObject = {}
+    for key, record in delivered.items():
+        if not isinstance(key, str):
+            retained[key] = record
+            continue
+        use_case_id, separator, fingerprint = key.partition(":")
+        entry = use_cases.get(use_case_id)
+        if not separator or not isinstance(entry, Mapping) or use_case_id in diagnostics:
+            retained[key] = record
+            continue
+        active = entry.get("active")
+        if isinstance(active, list) and fingerprint in active:
+            retained[key] = record
+    return retained
 
 
 def _is_due(
