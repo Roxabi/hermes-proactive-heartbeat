@@ -1,6 +1,6 @@
 # hermes-proactive-heartbeats
 
-Native Hermes plugin for named proactive heartbeats: collectors emit signals, deterministic gates and optional TypeSafe judgments choose whether to wake the agent, and Hermes Cron owns scheduling, the `wakeAgent` gate, and delivery. One plugin, many heartbeats — each with its own JSON, cron job, shim, and persisted state.
+Native Hermes plugin for named proactive heartbeats: collectors emit signals with explicit deterministic actions or semantic judgments, optional TypeSafe resolves only semantic decisions, and Hermes Cron owns scheduling, the `wakeAgent` gate, and delivery. One plugin, many heartbeats — each with its own JSON, cron job, shim, and persisted state.
 
 ## What this plugin provides
 
@@ -9,11 +9,11 @@ This plugin turns Hermes Cron into a set of named, stateful proactive pipelines.
 - run multiple independent heartbeats from one plugin;
 - reuse one collector implementation across heartbeats with different configuration;
 - choose a schedule, delivery target, context, and cooldown policy per heartbeat;
-- combine deterministic eligibility gates with one optional batched TypeSafe judgment;
-- retain deduplication and pending-candidate state between ticks; and
+- choose an `ActionSpec` rule or an optional batched TypeSafe `JudgmentSpec` per signal;
+- retain deduplication and reuse pending decisions while their facts remain unchanged; and
 - keep hostnames, repositories, channels, credentials, and monitoring policy outside the public plugin.
 
-The plugin does not ship operator-specific collectors or run its own scheduler. Hermes Cron owns scheduling and delivery; this plugin owns collection, eligibility, judgment, candidate selection, and persisted heartbeat state.
+The plugin does not ship operator-specific collectors or run its own scheduler. Hermes Cron owns scheduling and delivery; this plugin owns collection, eligibility, decision resolution, candidate selection, and persisted heartbeat state.
 
 ## Terminology
 
@@ -23,8 +23,8 @@ The plugin does not ship operator-specific collectors or run its own scheduler. 
 | **Heartbeat** | A named proactive pipeline declared by one `heartbeats/{name}.json` file. It has one managed cron job, one generated shim, and one independent state key. |
 | **Collector** | An operator-owned Python module at `collectors/{id}.py`. Its `Collector` class observes one source and returns a snapshot. The same collector can be enabled by several heartbeats. |
 | **Snapshot** | One collector result: current signals, collector state for the next tick, and optional soft diagnostics. |
-| **Signal** | An observation with a stable fingerprint, compact facts, and a judgment specification describing the allowed actions. |
-| **Tick** | One `collect → gate → judge → select → render` cycle for one heartbeat. |
+| **Signal** | An observation with a stable fingerprint, compact facts, and a `decision`: either a deterministic `ActionSpec` or semantic `JudgmentSpec`. |
+| **Tick** | One `collect → gate → decide → select → render` cycle for one heartbeat. |
 | **Candidate** | The single selected wake payload for a tick. Without a candidate, stdout is exactly `{"wakeAgent": false}`. |
 
 The cardinality is: **one plugin → many heartbeats → many collectors → many signals**. Collector code is reusable, while delivery, context, deduplication, and state remain isolated per heartbeat.
@@ -35,8 +35,8 @@ The cardinality is: **one plugin → many heartbeats → many collectors → man
 2. The shim calls `hermes proactive-heartbeats tick --name {name}`.
 3. The plugin merges the root defaults with `heartbeats/{name}.json`.
 4. Each enabled collector is loaded from the operator directory and returns a `Snapshot`.
-5. Deterministic baseline, cooldown, active-fingerprint, and pending gates decide which signals are due.
-6. Due signals are judged in one optional TypeSafe batch; deterministic fallback actions remain available without TypeSafe.
+5. Baseline, cooldown, active-fingerprint, and pending gates decide which signals are due.
+6. Deterministic `ActionSpec` rules resolve directly. Only due semantic `JudgmentSpec` decisions enter the optional TypeSafe batch; their configured fallback action applies when TypeSafe cannot decide.
 7. The plugin emits either the exact quiet gate or one `heartbeat_candidate`; Hermes Cron interprets stdout and owns delivery.
 
 ## File layout and ownership
@@ -50,7 +50,7 @@ The installed plugin checkout is generic code managed by Hermes:
 ├── cli.py               # setup, tick, status, doctor
 ├── config.py            # root + heartbeat configuration loading
 ├── registry.py          # operator collector discovery
-├── engine.py            # gates, TypeSafe batch, dedupe, selection
+├── engine.py            # gates, semantic batch, dedupe, selection
 ├── models.py            # collector SDK contracts
 └── collector_exec.py    # optional local-command / SSH helpers
 ```
@@ -154,7 +154,7 @@ Save this heartbeat as `$HERMES_HOME/proactive-heartbeats/heartbeats/care.json`.
 
 **Delivery target:** Hermes Cron `--deliver` grammar. Standalone CLI cron jobs have no chat `origin`, so prefer a concrete target such as `local`, `telegram`, `discord`, or `signal` (plus a configured home channel where applicable). `doctor` warns when a heartbeat still uses `origin`.
 
-Root `context` plus heartbeat `context` (file wins per key) are copied into every wake payload as `heartbeat_candidate.context`, with `heartbeat` and `now` added at tick time. Collector observations go in `inputs`; TypeSafe/fallback choice in `judgment`.
+Root `context` plus heartbeat `context` (file wins per key) are copied into every wake payload as `heartbeat_candidate.context`, with `heartbeat` and `now` added at tick time. Collector observations go in `heartbeat_candidate.inputs`; the authoritative selected action and its source go in `heartbeat_candidate.decision`. Sources are `rule` for a direct `ActionSpec`, `typesafe` for a mapped semantic answer, and `fallback` when the semantic answer is unavailable or invalid.
 
 Collectors are **not** shipped in this plugin. Each id in `collectors` loads `$HERMES_HOME/proactive-heartbeats/collectors/{id}.py` (user-owned). The plugin only provides the runtime and a small SDK (`models`, `collector_exec`). An enabled collector whose file is missing or unloadable fails `tick` and `doctor` (no quiet success).
 
@@ -162,19 +162,16 @@ Collectors are **not** shipped in this plugin. Each id in `collectors` loads `$H
 
 ### 4. Implement the collector
 
+`ActionSpec` requires `name`, an explicit `wake_agent` boolean, and `priority`; `instruction` defaults to `""` and `max_sentences` to `0`. Use the SDK's canonical `SILENT` action rather than defining another non-waking action.
+
 `$HERMES_HOME/proactive-heartbeats/collectors/probe.py`:
 
 ```python
-from models import ActionSpec, JudgmentSpec, Signal, Snapshot, TickContext
+from models import ActionSpec, JudgmentSpec, SILENT, Signal, Snapshot, TickContext
 
-SILENT = ActionSpec(
-    name="silent",
-    priority=0,
-    instruction="Do not message the user.",
-    max_sentences=0,
-)
 NOTIFY = ActionSpec(
     name="notify",
+    wake_agent=True,
     priority=50,
     instruction="Tell the user the probe fired in one short sentence.",
     max_sentences=1,
@@ -192,23 +189,31 @@ class Collector:
         token = str(self._config.get("token") or "").strip()
         if not token:
             return Snapshot(state={"ok": False}, diagnostics={"error": "unconfigured"})
+
+        # Direct ActionSpec rules never enter TypeSafe. Set semantic=true to
+        # use the JudgmentSpec option instead.
+        decision = NOTIFY
+        if self._config.get("semantic"):
+            decision = JudgmentSpec(
+                question={
+                    "type": "choice",
+                    "instructions": "Should the agent notify about this probe?",
+                    "criteria": {
+                        "silent": "Noise or already handled.",
+                        "notify": "Worth a short proactive message.",
+                    },
+                },
+                actions={"silent": SILENT, "notify": NOTIFY},
+                fallback_label="notify",
+            )
+
         return Snapshot(
             signals=(
                 Signal(
                     fingerprint=f"probe:{token}",
                     facts={"token": token},
-                    judgment=JudgmentSpec(
-                        question={
-                            "type": "choice",
-                            "instructions": "Should the agent notify about this probe?",
-                            "criteria": {
-                                "silent": "Noise or already handled.",
-                                "notify": "Worth a short proactive message.",
-                            },
-                        },
-                        actions={"silent": SILENT, "notify": NOTIFY},
-                        fallback_label="notify",
-                    ),
+                    decision=decision,
+                    initial_observation="eligible",
                 ),
             ),
             state={"ok": True, "token": token},
@@ -232,9 +237,9 @@ hermes proactive-heartbeats doctor
 hermes proactive-heartbeats tick --name care
 ```
 
-The first successful tick establishes a silent baseline and prints exactly `{"wakeAgent": false}`. A later due signal can produce one `heartbeat_candidate` object; collector failures print a diagnostic to stderr and exit non-zero.
+By default, a newly observed fingerprint uses `initial_observation="baseline"` and is recorded without resolution. This example explicitly uses `"eligible"`, so its signal is due on first observation and can produce a `heartbeat_candidate`; collector failures print a diagnostic to stderr and exit non-zero.
 
-Optional TypeSafe key (deterministic fallbacks stay active without it):
+Optional TypeSafe key (direct rules remain deterministic, and semantic decisions use their configured fallback without it):
 
 ```bash
 # $HERMES_HOME/.env
@@ -264,17 +269,18 @@ Wake ticks print one compact JSON object with `heartbeat_candidate` (no `wakeAge
 
 ### Tick semantics (short)
 
-- **First tick** is a silent baseline: active fingerprints are stored and stamped `action: baseline` so cooldown can expire and re-evaluate later.
-- **Non-winning** due candidates stay in `pending` and are reconsidered on the next tick.
-- **Silent** TypeSafe/fallback decisions are stamped so they are not suppressed forever; they become due again after cooldown.
-- Soft `Snapshot.diagnostics` stay in collector state; hard collector exceptions or invalid return types fail the tick.
+- **Initial observation** defaults to `"baseline"`: a newly observed active fingerprint is stored without resolution. A signal with `initial_observation="eligible"` is due and resolved on that first observation.
+- **Deterministic decisions** resolve directly with source `rule` and never enter TypeSafe. A direct non-waking action remains active, stamps its silent/cooldown state, and yields no candidate.
+- **Pending decisions** are reused without TypeSafe while the signal remains active with unchanged facts. Changed facts are resolved again, and a disappeared signal is dropped; current context is used when a cached candidate is reconstructed.
+- **Semantic decisions** alone enter the TypeSafe batch. Mapped answers use source `typesafe`; malformed, unmapped, or unavailable answers use the configured action with source `fallback`.
+- **Soft diagnostics** stay in collector state; hard collector exceptions or invalid return types fail the tick.
 
 ## Architecture
 
 | Layer | Owner |
 | --- | --- |
 | Schedule / wake gate / delivery | Hermes Cron (one job per heartbeat) |
-| Collect / dedupe / TypeSafe batch / candidate | this plugin (state key `heartbeat:{name}`) |
+| Collect / dedupe / semantic batch / candidate | this plugin (state key `heartbeat:{name}`) |
 | Registration only (no background loops) | `register(ctx)` |
 
 Durable plugin state lives under `$HERMES_HOME/plugin-data/` via `ctx.state`. Setup never edits `jobs.json` directly; it uses `hermes cron create|edit`.
@@ -282,9 +288,10 @@ Durable plugin state lives under `$HERMES_HOME/plugin-data/` via `ctx.state`. Se
 ## Add a collector
 
 1. Write `$HERMES_HOME/proactive-heartbeats/collectors/{id}.py` with a `Collector` (or any class with `collect()` and matching `id`).
-2. Emit stable fingerprints and compact facts; put trusted `ActionSpec` values in each signal's `JudgmentSpec`.
-3. Enable it from a heartbeat JSON: `collectors.{id}.enabled: true`.
-4. Run `hermes proactive-heartbeats doctor` then one `tick --name …`.
+2. Emit stable fingerprints and compact facts. Set `decision` to a direct `ActionSpec` rule or a `JudgmentSpec` that maps semantic labels to trusted actions.
+3. Choose whether a newly observed fingerprint uses the default `initial_observation="baseline"` or opts into first-observation resolution with `"eligible"`.
+4. Enable it from a heartbeat JSON: `collectors.{id}.enabled: true`.
+5. Run `hermes proactive-heartbeats doctor` then one `tick --name …`.
 
 ## Remove
 

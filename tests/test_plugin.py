@@ -148,14 +148,16 @@ class PluginTickHandlerTests(IsolatedHomeTestCase):
             self.skipTest("plugin register() is not importable without a Hermes install")
 
         previous_state = {
-            "version": 1,
+            "version": 2,
             "use_cases": {},
             "delivered": {},
+            "pending": {},
         }
         next_state = {
-            "version": 1,
+            "version": 2,
             "use_cases": {"host": {"state": {}, "active": []}},
             "delivered": {},
+            "pending": {},
         }
         rendered = '{"wakeAgent": false}'
         tick_result = SimpleNamespace(state=next_state, diagnostics={}, render=lambda: rendered)

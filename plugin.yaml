@@ -3,7 +3,7 @@ version: 0.0.1
 manifest_version: 1
 api_version: 1
 kind: standalone
-description: Extensible proactive heartbeats for Hermes with named crons, deterministic gates, and optional TypeSafe filtering.
+description: Extensible proactive heartbeats for Hermes with named crons, deterministic rules, and optional TypeSafe semantic decisions.
 author: Roxabi
 license: MIT
 homepage: https://github.com/Roxabi/hermes-proactive-heartbeats
@@ -13,7 +13,7 @@ provides_tools: []
 provides_hooks: []
 optional_env:
   - name: TYPESAFE_API_KEY
-    description: Optional TypeSafe API key for semantic judgments; deterministic fallbacks remain available without it.
+    description: Optional TypeSafe API key for semantic decisions; direct rules never use it, and configured fallbacks apply without it.
     secret: true
 config_schema:
   config_dir:

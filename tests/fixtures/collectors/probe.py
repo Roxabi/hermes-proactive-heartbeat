@@ -9,12 +9,14 @@ from models import ActionSpec, JudgmentSpec, Signal, Snapshot, TickContext
 
 SILENT = ActionSpec(
     name="silent",
+    wake_agent=False,
     priority=0,
     instruction="Do not message the user.",
     max_sentences=0,
 )
 INCLUDE = ActionSpec(
     name="include",
+    wake_agent=True,
     priority=10,
     instruction="Mention the probe token in one sentence.",
     max_sentences=1,
@@ -37,7 +39,7 @@ class Collector:
                 Signal(
                     fingerprint=f"probe:{token}",
                     facts={"token": token},
-                    judgment=JudgmentSpec(
+                    decision=JudgmentSpec(
                         question={
                             "id": "probe",
                             "type": "bool",

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 JsonObject = dict[str, Any]
 
@@ -15,9 +15,13 @@ class ActionSpec:
     """Trusted delivery behavior selected by code or a semantic judgment."""
 
     name: str
+    wake_agent: bool
     priority: int
-    instruction: str
-    max_sentences: int = 1
+    instruction: str = ""
+    max_sentences: int = 0
+
+
+SILENT = ActionSpec(name="silent", wake_agent=False, priority=0)
 
 
 @dataclass(frozen=True)
@@ -35,7 +39,8 @@ class Signal:
 
     fingerprint: str
     facts: JsonObject
-    judgment: JudgmentSpec
+    decision: ActionSpec | JudgmentSpec
+    initial_observation: Literal["baseline", "eligible"] = "baseline"
     repeat_after_seconds: int | None = None
 
 
@@ -57,25 +62,22 @@ class Candidate:
     action: ActionSpec
     facts: JsonObject
     context: JsonObject = field(default_factory=dict)
-    judgment: JsonObject = field(default_factory=dict)
+    decision: JsonObject = field(default_factory=dict)
 
     def as_json(self) -> JsonObject:
-        label = self.judgment.get("label") if isinstance(self.judgment, Mapping) else None
-        source = self.judgment.get("source") if isinstance(self.judgment, Mapping) else None
+        metadata = self.decision if isinstance(self.decision, Mapping) else {}
+        source = metadata.get("source")
         return {
             "collector": self.collector,
             "fingerprint": self.fingerprint,
             "action": self.action.name,
             "priority": self.action.priority,
             "inputs": self.facts,
-            "judgment": {
-                "label": label or self.action.name,
+            "decision": {
                 "action": self.action.name,
                 "source": source or "fallback",
                 **{
-                    key: value
-                    for key, value in (self.judgment or {}).items()
-                    if key not in {"label", "action", "source"}
+                    key: value for key, value in metadata.items() if key not in {"action", "source"}
                 },
             },
             "context": self.context,

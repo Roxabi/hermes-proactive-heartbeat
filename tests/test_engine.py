@@ -41,12 +41,33 @@ class FakeTypeSafe:
         return self.answers
 
 
-def action(name: str, priority: int) -> ActionSpec:
+def action(name: str, priority: int, *, wake_agent: bool = True) -> ActionSpec:
     return ActionSpec(
         name=name,
+        wake_agent=wake_agent,
         priority=priority,
         instruction=f"Deliver {name}",
         max_sentences=2,
+    )
+
+
+def rule_signal(
+    fingerprint: str,
+    *,
+    priority: int = 10,
+    wake_agent: bool = True,
+    initial_observation: str = "baseline",
+    facts: dict[str, Any] | None = None,
+) -> Signal:
+    return Signal(
+        fingerprint=fingerprint,
+        facts=facts or {"fingerprint": fingerprint},
+        decision=action(
+            "notify" if wake_agent else "record_only",
+            priority,
+            wake_agent=wake_agent,
+        ),
+        initial_observation=initial_observation,
     )
 
 
@@ -56,13 +77,15 @@ def choice_signal(
     priority: int = 10,
     fallback_label: str = "silent",
     repeat_after_seconds: int | None = None,
+    initial_observation: str = "baseline",
+    facts: dict[str, Any] | None = None,
 ) -> Signal:
     notify = action("notify", priority)
-    silent = action("silent", 0)
+    silent = action("silent", 0, wake_agent=False)
     return Signal(
         fingerprint=fingerprint,
-        facts={"fingerprint": fingerprint},
-        judgment=JudgmentSpec(
+        facts=facts or {"fingerprint": fingerprint},
+        decision=JudgmentSpec(
             question={
                 "type": "choice",
                 "instructions": "Choose whether this signal warrants delivery.",
@@ -72,6 +95,7 @@ def choice_signal(
             fallback_label=fallback_label,
         ),
         repeat_after_seconds=repeat_after_seconds,
+        initial_observation=initial_observation,
     )
 
 
@@ -119,7 +143,7 @@ class HeartbeatEngineTests(IsolatedHomeTestCase):
         self.assertEqual(
             result.state,
             {
-                "version": 1,
+                "version": 2,
                 "use_cases": {
                     "host": {"state": {"sample": 1}, "active": ["disk:root"]},
                 },
@@ -129,9 +153,36 @@ class HeartbeatEngineTests(IsolatedHomeTestCase):
                         "action": "baseline",
                     }
                 },
-                "pending": [],
+                "pending": {},
             },
         )
+
+    def test_initial_observation_eligible_can_wake_on_tick_one(self) -> None:
+        default = FakeUseCase(
+            "default",
+            [Snapshot(signals=(rule_signal("default"),))],
+        )
+        eligible = FakeUseCase(
+            "eligible",
+            [Snapshot(signals=(rule_signal("eligible", initial_observation="eligible"),))],
+        )
+
+        default_result = HeartbeatEngine([default], typesafe=FakeTypeSafe({})).tick(
+            context(),
+            previous_state=None,
+        )
+        eligible_typesafe = FakeTypeSafe({})
+        eligible_result = HeartbeatEngine(
+            [eligible],
+            typesafe=eligible_typesafe,
+        ).tick(context(), previous_state=None)
+
+        self.assertIsNone(default_result.candidate)
+        self.assertIsNotNone(eligible_result.candidate)
+        assert eligible_result.candidate is not None
+        self.assertEqual(eligible_result.candidate.fingerprint, "eligible")
+        self.assertEqual(eligible_result.candidate.decision["source"], "rule")
+        self.assertEqual(eligible_typesafe.calls, [])
 
     def test_unchanged_active_signal_stays_silent_without_semantic_evaluation(self) -> None:
         typesafe = FakeTypeSafe({})
@@ -153,6 +204,43 @@ class HeartbeatEngineTests(IsolatedHomeTestCase):
         self.assertEqual(result.state["use_cases"]["host"]["active"], ["disk:root"])
         self.assertEqual(use_case.previous_states, [{}, {"sample": 1}])
 
+    def test_direct_waking_rule_skips_typesafe(self) -> None:
+        typesafe = FakeTypeSafe({})
+        engine = HeartbeatEngine(
+            [
+                FakeUseCase(
+                    "rules",
+                    [Snapshot(), Snapshot(signals=(rule_signal("urgent", priority=90),))],
+                )
+            ],
+            typesafe=typesafe,
+        )
+        baseline = engine.tick(context(), previous_state=None)
+
+        result = engine.tick(context(), previous_state=baseline.state)
+
+        self.assertIsNotNone(result.candidate)
+        assert result.candidate is not None
+        self.assertEqual(result.candidate.fingerprint, "urgent")
+        self.assertEqual(result.candidate.decision["source"], "rule")
+        self.assertEqual(typesafe.calls, [])
+
+    def test_direct_silent_action_remains_active_without_wake(self) -> None:
+        typesafe = FakeTypeSafe({})
+        signal = rule_signal("record", wake_agent=False)
+        engine = HeartbeatEngine(
+            [FakeUseCase("rules", [Snapshot(), Snapshot(signals=(signal,))])],
+            typesafe=typesafe,
+        )
+        baseline = engine.tick(context(), previous_state=None)
+
+        result = engine.tick(context(), previous_state=baseline.state)
+
+        self.assertIsNone(result.candidate)
+        self.assertEqual(result.render(), '{"wakeAgent": false}')
+        self.assertEqual(result.state["use_cases"]["rules"]["active"], ["record"])
+        self.assertEqual(typesafe.calls, [])
+
     def test_new_signal_uses_its_fallback_when_typesafe_is_unavailable(self) -> None:
         notify = choice_signal("disk:root", fallback_label="notify")
         use_case = FakeUseCase(
@@ -172,6 +260,7 @@ class HeartbeatEngineTests(IsolatedHomeTestCase):
         assert result.candidate is not None
         self.assertEqual(result.candidate.fingerprint, "disk:root")
         self.assertEqual(result.candidate.action.name, "notify")
+        self.assertEqual(result.candidate.decision["source"], "fallback")
         self.assertEqual(len(typesafe.calls), 1)
 
     def test_all_due_questions_are_batched_and_highest_priority_candidate_wins(self) -> None:
@@ -209,8 +298,45 @@ class HeartbeatEngineTests(IsolatedHomeTestCase):
         self.assertEqual(result.candidate.collector, "beta")
         self.assertEqual(result.candidate.fingerprint, "high")
         self.assertEqual(result.candidate.action.priority, 80)
+        self.assertEqual(result.candidate.decision["source"], "typesafe")
 
-    def test_non_winning_candidate_remains_pending_for_the_next_tick(self) -> None:
+    def test_mixed_rules_and_semantic_signals_share_ranking(self) -> None:
+        direct = FakeUseCase(
+            "alpha",
+            [Snapshot(), Snapshot(signals=(rule_signal("rule", priority=90),))],
+        )
+        semantic = FakeUseCase(
+            "beta",
+            [Snapshot(), Snapshot(signals=(choice_signal("semantic", priority=80),))],
+        )
+
+        def answer_notify(questions: Any) -> dict[str, Any]:
+            return {
+                question_id: choice_answer("notify")
+                for question_id, _question in question_items(questions)
+            }
+
+        typesafe = FakeTypeSafe(answer_notify)
+        engine = HeartbeatEngine([semantic, direct], typesafe=typesafe)
+        baseline = engine.tick(context(), previous_state=None)
+
+        result = engine.tick(context(), previous_state=baseline.state)
+
+        self.assertEqual(len(typesafe.calls), 1)
+        _, questions = typesafe.calls[0]
+        self.assertEqual(
+            [question_id for question_id, _question in question_items(questions)],
+            ["beta:semantic"],
+        )
+        self.assertIsNotNone(result.candidate)
+        assert result.candidate is not None
+        self.assertEqual(result.candidate.collector, "alpha")
+        self.assertEqual(result.candidate.fingerprint, "rule")
+        self.assertEqual(result.candidate.action.priority, 90)
+        self.assertEqual(result.candidate.decision, {"action": "notify", "source": "rule"})
+        self.assertIn("beta:semantic", result.state["pending"])
+
+    def test_semantic_loser_is_reused_without_a_second_typesafe_call(self) -> None:
         low_signal = choice_signal("low", priority=20)
         high_signal = choice_signal("high", priority=80)
         low = FakeUseCase(
@@ -228,7 +354,8 @@ class HeartbeatEngineTests(IsolatedHomeTestCase):
                 for question_id, _question in question_items(questions)
             }
 
-        engine = HeartbeatEngine([high, low], typesafe=FakeTypeSafe(answer_notify))
+        typesafe = FakeTypeSafe(answer_notify)
+        engine = HeartbeatEngine([high, low], typesafe=typesafe)
         baseline = engine.tick(context(), previous_state=None)
         first = engine.tick(context(), previous_state=baseline.state)
         second = engine.tick(context(), previous_state=first.state)
@@ -236,9 +363,71 @@ class HeartbeatEngineTests(IsolatedHomeTestCase):
         assert first.candidate is not None
         assert second.candidate is not None
         self.assertEqual(first.candidate.collector, "beta")
-        self.assertEqual(first.state["pending"], ["alpha:low"])
+        self.assertIsInstance(first.state["pending"], dict)
+        self.assertIn("alpha:low", first.state["pending"])
         self.assertEqual(second.candidate.collector, "alpha")
-        self.assertEqual(second.state["pending"], [])
+        self.assertEqual(second.state["pending"], {})
+        self.assertEqual(len(typesafe.calls), 1)
+
+    def test_changed_pending_facts_force_a_fresh_typesafe_call(self) -> None:
+        low_before = choice_signal("low", priority=20, facts={"sample": 1})
+        low_after = choice_signal("low", priority=20, facts={"sample": 2})
+        high = choice_signal("high", priority=80)
+        low_use_case = FakeUseCase(
+            "alpha",
+            [Snapshot(), Snapshot(signals=(low_before,)), Snapshot(signals=(low_after,))],
+        )
+        high_use_case = FakeUseCase(
+            "beta",
+            [Snapshot(), Snapshot(signals=(high,)), Snapshot()],
+        )
+
+        def answer_notify(questions: Any) -> dict[str, Any]:
+            return {
+                question_id: choice_answer("notify")
+                for question_id, _question in question_items(questions)
+            }
+
+        typesafe = FakeTypeSafe(answer_notify)
+        engine = HeartbeatEngine([high_use_case, low_use_case], typesafe=typesafe)
+        baseline = engine.tick(context(), previous_state=None)
+        first = engine.tick(context(), previous_state=baseline.state)
+        second = engine.tick(context(), previous_state=first.state)
+
+        assert first.candidate is not None
+        assert second.candidate is not None
+        self.assertEqual(first.candidate.collector, "beta")
+        self.assertEqual(second.candidate.collector, "alpha")
+        self.assertEqual(second.candidate.facts, {"sample": 2})
+        self.assertEqual(len(typesafe.calls), 2)
+
+    def test_disappeared_signal_is_removed_from_pending(self) -> None:
+        low = choice_signal("low", priority=20)
+        high = choice_signal("high", priority=80)
+        low_use_case = FakeUseCase(
+            "alpha",
+            [Snapshot(), Snapshot(signals=(low,)), Snapshot()],
+        )
+        high_use_case = FakeUseCase(
+            "beta",
+            [Snapshot(), Snapshot(signals=(high,)), Snapshot(signals=(high,))],
+        )
+
+        def answer_notify(questions: Any) -> dict[str, Any]:
+            return {
+                question_id: choice_answer("notify")
+                for question_id, _question in question_items(questions)
+            }
+
+        typesafe = FakeTypeSafe(answer_notify)
+        engine = HeartbeatEngine([high_use_case, low_use_case], typesafe=typesafe)
+        baseline = engine.tick(context(), previous_state=None)
+        first = engine.tick(context(), previous_state=baseline.state)
+        second = engine.tick(context(), previous_state=first.state)
+
+        self.assertIn("alpha:low", first.state["pending"])
+        self.assertNotIn("alpha:low", second.state["pending"])
+        self.assertEqual(len(typesafe.calls), 1)
 
     def test_failed_collector_fails_closed_and_queues_healthy_dues(self) -> None:
         failing = FakeUseCase("broken", [RuntimeError("collector offline")])
@@ -247,13 +436,13 @@ class HeartbeatEngineTests(IsolatedHomeTestCase):
             [Snapshot(signals=(choice_signal("new", fallback_label="notify"),))],
         )
         previous = {
-            "version": 1,
+            "version": 2,
             "use_cases": {
                 "broken": {"state": {"cursor": "keep"}, "active": ["old"]},
                 "healthy": {"state": {}, "active": []},
             },
             "delivered": {},
-            "pending": [],
+            "pending": {},
         }
 
         result = HeartbeatEngine(
@@ -269,7 +458,8 @@ class HeartbeatEngineTests(IsolatedHomeTestCase):
             {"state": {"cursor": "keep"}, "active": ["old"]},
         )
         self.assertEqual(result.state["use_cases"]["healthy"]["active"], ["new"])
-        self.assertEqual(result.state["pending"], ["healthy:new"])
+        self.assertIsInstance(result.state["pending"], dict)
+        self.assertIn("healthy:new", result.state["pending"])
         self.assertIn("broken", result.diagnostics)
 
     def test_delivered_signal_stays_silent_inside_default_cooldown(self) -> None:
@@ -314,10 +504,10 @@ class HeartbeatEngineTests(IsolatedHomeTestCase):
     def test_active_signal_without_a_delivery_record_stays_eligible(self) -> None:
         signal = choice_signal("disk:root", fallback_label="notify")
         previous = {
-            "version": 1,
+            "version": 2,
             "use_cases": {"host": {"state": {}, "active": ["disk:root"]}},
             "delivered": {},
-            "pending": [],
+            "pending": {},
         }
 
         result = HeartbeatEngine(
@@ -371,6 +561,7 @@ class TickResultRenderingTests(IsolatedHomeTestCase):
             fingerprint="care:water",
             action=action("water", 70),
             facts={"plant": "fern"},
+            decision={"action": "water", "source": "rule"},
         )
         result = TickResult(candidate=candidate, state={}, diagnostics={})
 
@@ -388,10 +579,9 @@ class TickResultRenderingTests(IsolatedHomeTestCase):
                     "action": "water",
                     "priority": 70,
                     "inputs": {"plant": "fern"},
-                    "judgment": {
-                        "label": "water",
+                    "decision": {
                         "action": "water",
-                        "source": "fallback",
+                        "source": "rule",
                     },
                     "context": {},
                     "delivery": {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -12,13 +13,23 @@ try:
     from . import _bootstrap  # noqa: F401
 except ImportError:  # flat plugin-dir / unittest load
     import _bootstrap  # noqa: F401
-from models import Candidate, HeartbeatUseCase, JsonObject, Signal, Snapshot, TickContext
+from models import (
+    ActionSpec,
+    Candidate,
+    HeartbeatUseCase,
+    JsonObject,
+    JudgmentSpec,
+    Signal,
+    Snapshot,
+    TickContext,
+)
 
-STATE_VERSION = 1
+STATE_VERSION = 2
 _MAX_FACT_KEYS = 32
 _MAX_FACT_DEPTH = 4
 _MAX_FACT_STRING = 500
 _MAX_FACT_LIST = 32
+_INITIAL_OBSERVATIONS = frozenset({"baseline", "eligible"})
 
 
 class SupportsEvaluate(Protocol):
@@ -80,14 +91,13 @@ class HeartbeatEngine:
         prior = _coerce_previous(previous_state if previous_state is not None else previous)
         is_baseline = prior is None
         previous_root = prior or _empty_state()
-        previous_pending = {
-            str(item) for item in (previous_root.get("pending") or []) if isinstance(item, str)
-        }
+        previous_pending = _coerce_pending(previous_root.get("pending"))
 
         diagnostics: JsonObject = {}
         next_use_cases: dict[str, JsonObject] = {}
         due: list[_DueSignal] = []
-        retained_pending: set[str] = set()
+        retained_pending: dict[str, JsonObject] = {}
+        signal_index: dict[str, Signal] = {}
 
         for use_case in self.use_cases:
             previous_entry = _use_case_entry(previous_root, use_case.id)
@@ -105,7 +115,11 @@ class HeartbeatEngine:
                 if isinstance(previous_entry.get("diagnostics"), dict):
                     next_use_cases[use_case.id]["diagnostics"] = dict(previous_entry["diagnostics"])
                 retained_pending.update(
-                    key for key in previous_pending if key.startswith(f"{use_case.id}:")
+                    {
+                        key: dict(record)
+                        for key, record in previous_pending.items()
+                        if key.startswith(f"{use_case.id}:")
+                    }
                 )
                 continue
 
@@ -119,7 +133,30 @@ class HeartbeatEngine:
                     "active": list(previous_entry.get("active") or []),
                 }
                 retained_pending.update(
-                    key for key in previous_pending if key.startswith(f"{use_case.id}:")
+                    {
+                        key: dict(record)
+                        for key, record in previous_pending.items()
+                        if key.startswith(f"{use_case.id}:")
+                    }
+                )
+                continue
+
+            invalid = _first_invalid_signal(snapshot.signals)
+            if invalid is not None:
+                diagnostics[use_case.id] = {
+                    "error": "TypeError",
+                    "message": invalid,
+                }
+                next_use_cases[use_case.id] = {
+                    "state": dict(previous_entry.get("state") or {}),
+                    "active": list(previous_entry.get("active") or []),
+                }
+                retained_pending.update(
+                    {
+                        key: dict(record)
+                        for key, record in previous_pending.items()
+                        if key.startswith(f"{use_case.id}:")
+                    }
                 )
                 continue
 
@@ -133,14 +170,15 @@ class HeartbeatEngine:
                 next_entry["diagnostics"] = _bound_facts(snapshot.diagnostics)
             next_use_cases[use_case.id] = next_entry
 
-            if is_baseline:
-                continue
-
             previous_active = {
                 str(item) for item in (previous_entry.get("active") or []) if item is not None
             }
             for signal in snapshot.signals:
-                if _is_due(
+                key = _delivery_key(use_case.id, signal.fingerprint)
+                signal_index[key] = signal
+                if is_baseline and signal.initial_observation != "eligible":
+                    continue
+                if (not is_baseline) and not _is_due(
                     use_case_id=use_case.id,
                     signal=signal,
                     previous_active=previous_active,
@@ -149,53 +187,52 @@ class HeartbeatEngine:
                     default_cooldown=_default_cooldown(context.settings),
                     pending=previous_pending,
                 ):
-                    due.append(
-                        _DueSignal(
-                            use_case_id=use_case.id,
-                            signal=signal,
-                            question_id=_question_id(use_case.id, signal.fingerprint),
-                        )
+                    continue
+                due.append(
+                    _DueSignal(
+                        use_case_id=use_case.id,
+                        signal=signal,
+                        question_id=_question_id(use_case.id, signal.fingerprint),
                     )
+                )
 
         delivered = dict(previous_root.get("delivered") or {})
         if is_baseline:
-            # Stamp baseline observations so cooldown can expire and re-evaluate later.
             for use_case_id, entry in next_use_cases.items():
+                if use_case_id in diagnostics:
+                    continue
                 for fingerprint in entry.get("active") or []:
                     if not isinstance(fingerprint, str):
                         continue
-                    delivered[_delivery_key(use_case_id, fingerprint)] = {
+                    key = _delivery_key(use_case_id, fingerprint)
+                    signal = signal_index.get(key)
+                    if signal is None or signal.initial_observation == "eligible":
+                        continue
+                    delivered[key] = {
                         "at": _iso(context.now),
                         "action": "baseline",
                     }
-            return TickResult(
-                candidate=None,
-                state={
-                    "version": STATE_VERSION,
-                    "use_cases": next_use_cases,
-                    "delivered": delivered,
-                    "pending": sorted(retained_pending),
-                },
-                diagnostics=diagnostics,
-            )
 
         if diagnostics:
             # Hard collector failures: fail closed — no wake, queue due signals for retry.
-            queued = retained_pending | {
-                _delivery_key(item.use_case_id, item.signal.fingerprint) for item in due
-            }
+            queued = dict(retained_pending)
+            for item in due:
+                key = _delivery_key(item.use_case_id, item.signal.fingerprint)
+                queued[key] = {
+                    "queued_at": _iso(context.now),
+                }
             return TickResult(
                 candidate=None,
                 state={
                     "version": STATE_VERSION,
                     "use_cases": next_use_cases,
                     "delivered": delivered,
-                    "pending": sorted(queued),
+                    "pending": _sorted_pending(queued),
                 },
                 diagnostics=diagnostics,
             )
 
-        answers = self._evaluate_due(context, due) if due else None
+        answers, judge_ids = self._evaluate_due(context, due, previous_pending)
         candidates = [
             candidate
             for item in due
@@ -205,6 +242,8 @@ class HeartbeatEngine:
                     answers,
                     context=context,
                     threshold=_threshold(context.settings),
+                    previous_pending=previous_pending,
+                    judge_ids=judge_ids,
                 )
             ]
             if candidate is not None
@@ -233,14 +272,25 @@ class HeartbeatEngine:
                 "action": "silent",
             }
 
-        next_pending = retained_pending | {key for key in candidate_keys if key != winner_key}
+        next_pending = dict(retained_pending)
+        for candidate in candidates:
+            key = _delivery_key(candidate.collector, candidate.fingerprint)
+            if key == winner_key:
+                continue
+            next_pending[key] = {
+                "action": _action_as_json(candidate.action),
+                "decision": dict(candidate.decision),
+                "facts_digest": _facts_digest(candidate.facts),
+                "queued_at": _iso(context.now),
+            }
+
         return TickResult(
             candidate=winner,
             state={
                 "version": STATE_VERSION,
                 "use_cases": next_use_cases,
                 "delivered": delivered,
-                "pending": sorted(next_pending),
+                "pending": _sorted_pending(next_pending),
             },
             diagnostics=diagnostics,
         )
@@ -249,11 +299,24 @@ class HeartbeatEngine:
         self,
         context: TickContext,
         due: list[_DueSignal],
-    ) -> dict[str, Any] | None:
-        if self.typesafe_client is None or not due:
-            return None
+        previous_pending: Mapping[str, JsonObject],
+    ) -> tuple[dict[str, Any] | None, set[str]]:
+        questions: dict[str, dict[str, Any]] = {}
+        judge_ids: set[str] = set()
+        for item in due:
+            decision = item.signal.decision
+            if not isinstance(decision, JudgmentSpec):
+                continue
+            key = _delivery_key(item.use_case_id, item.signal.fingerprint)
+            pending_record = previous_pending.get(key)
+            if _pending_reusable(pending_record, item.signal.facts):
+                continue
+            questions[item.question_id] = dict(decision.question)
+            judge_ids.add(item.question_id)
 
-        questions = {item.question_id: dict(item.signal.judgment.question) for item in due}
+        if self.typesafe_client is None or not questions:
+            return None, judge_ids
+
         state = {
             "now": _iso(context.now),
             "signals": {
@@ -263,12 +326,13 @@ class HeartbeatEngine:
                     "facts": _bound_facts(item.signal.facts),
                 }
                 for item in due
+                if item.question_id in judge_ids
             },
         }
         try:
-            return self.typesafe_client.evaluate(state, questions)
+            return self.typesafe_client.evaluate(state, questions), judge_ids
         except Exception:  # noqa: BLE001 - treat client failures as unavailable
-            return None
+            return None, judge_ids
 
 
 @dataclass(frozen=True)
@@ -295,7 +359,7 @@ def _coerce_previous(previous: Mapping[str, Any] | None) -> JsonObject | None:
 
 
 def _empty_state() -> JsonObject:
-    return {"version": STATE_VERSION, "use_cases": {}, "delivered": {}, "pending": []}
+    return {"version": STATE_VERSION, "use_cases": {}, "delivered": {}, "pending": {}}
 
 
 def _use_case_entry(state: Mapping[str, Any], use_case_id: str) -> JsonObject:
@@ -344,7 +408,7 @@ def _is_due(
     signal: Signal,
     previous_active: set[str],
     delivered: Mapping[str, Any],
-    pending: set[str],
+    pending: Mapping[str, Any],
     now: datetime,
     default_cooldown: int,
 ) -> bool:
@@ -381,32 +445,70 @@ def _resolve_candidate(
     *,
     context: TickContext,
     threshold: float,
+    previous_pending: Mapping[str, JsonObject],
+    judge_ids: set[str],
 ) -> Candidate | None:
-    judgment = item.signal.judgment
+    decision = item.signal.decision
+    facts = _bound_facts(item.signal.facts)
+    candidate_context = _candidate_context(context)
+    key = _delivery_key(item.use_case_id, item.signal.fingerprint)
+
+    if isinstance(decision, ActionSpec):
+        if not decision.wake_agent:
+            return None
+        return Candidate(
+            collector=item.use_case_id,
+            fingerprint=item.signal.fingerprint,
+            action=decision,
+            facts=facts,
+            context=candidate_context,
+            decision={"action": decision.name, "source": "rule"},
+        )
+
+    pending_record = previous_pending.get(key)
+    if item.question_id not in judge_ids and _pending_reusable(pending_record, facts):
+        action = _action_from_json(pending_record.get("action") if pending_record else None)
+        decision_meta = (
+            dict(pending_record.get("decision") or {})
+            if isinstance(pending_record, Mapping)
+            and isinstance(pending_record.get("decision"), Mapping)
+            else {}
+        )
+        if action is None or not action.wake_agent:
+            return None
+        return Candidate(
+            collector=item.use_case_id,
+            fingerprint=item.signal.fingerprint,
+            action=action,
+            facts=facts,
+            context=candidate_context,
+            decision=decision_meta or {"action": action.name, "source": "fallback"},
+        )
+
     raw_answer = answers.get(item.question_id) if isinstance(answers, Mapping) else None
     label = _label_for_answer(
         raw_answer,
-        judgment=judgment,
+        judgment=decision,
         threshold=threshold,
     )
+    source = "typesafe" if label is not None else "fallback"
     if label is None:
-        label = judgment.fallback_label
+        label = decision.fallback_label
 
-    action = judgment.actions.get(label)
+    action = decision.actions.get(label)
     if action is None:
-        action = judgment.actions.get(judgment.fallback_label)
-    if action is None:
-        return None
-    if action.name == "silent" or label == "silent":
+        action = decision.actions.get(decision.fallback_label)
+        source = "fallback"
+    if action is None or not action.wake_agent:
         return None
 
     return Candidate(
         collector=item.use_case_id,
         fingerprint=item.signal.fingerprint,
         action=action,
-        facts=_bound_facts(item.signal.facts),
-        context=_candidate_context(context),
-        judgment=_judgment_meta(label=label, action=action, answer=raw_answer),
+        facts=facts,
+        context=candidate_context,
+        decision=_decision_meta(label=label, action=action, answer=raw_answer, source=source),
     )
 
 
@@ -422,11 +524,17 @@ def _candidate_context(context: TickContext) -> JsonObject:
     return _bound_facts(merged)
 
 
-def _judgment_meta(*, label: str, action: Any, answer: Any) -> JsonObject:
+def _decision_meta(
+    *,
+    label: str,
+    action: ActionSpec,
+    answer: Any,
+    source: str,
+) -> JsonObject:
     meta: JsonObject = {
         "label": label,
         "action": action.name,
-        "source": "typesafe" if answer is not None else "fallback",
+        "source": source,
     }
     if isinstance(answer, Mapping):
         for key in ("type", "choice", "noul"):
@@ -441,7 +549,7 @@ def _judgment_meta(*, label: str, action: Any, answer: Any) -> JsonObject:
 def _label_for_answer(
     answer: Any,
     *,
-    judgment: Any,
+    judgment: JudgmentSpec,
     threshold: float,
 ) -> str | None:
     if answer is None:
@@ -471,13 +579,13 @@ def _label_for_answer(
     return None
 
 
-def _noul_label(probability: float, *, judgment: Any, threshold: float) -> str:
+def _noul_label(probability: float, *, judgment: JudgmentSpec, threshold: float) -> str:
     if probability >= threshold:
         for key in ("include", "true", "notify", "yes"):
             if key in judgment.actions:
                 return key
         for key, action in judgment.actions.items():
-            if action.name != "silent" and key != judgment.fallback_label:
+            if action.wake_agent and key != judgment.fallback_label:
                 return key
     return judgment.fallback_label
 
@@ -495,29 +603,138 @@ def _select_winner(candidates: list[Candidate]) -> Candidate | None:
     )[0]
 
 
+def _first_invalid_signal(signals: tuple[Signal, ...]) -> str | None:
+    for signal in signals:
+        if not isinstance(signal, Signal):
+            return "snapshot signals must contain Signal values"
+        if not isinstance(signal.fingerprint, str) or not signal.fingerprint:
+            return "signal fingerprint must be a non-empty string"
+        if not isinstance(signal.facts, Mapping):
+            return "signal facts must be a mapping"
+        if not isinstance(signal.decision, (ActionSpec, JudgmentSpec)):
+            return "signal decision must be ActionSpec or JudgmentSpec"
+        if signal.initial_observation not in _INITIAL_OBSERVATIONS:
+            return "signal initial_observation must be 'baseline' or 'eligible'"
+        if isinstance(signal.decision, JudgmentSpec):
+            if not isinstance(signal.decision.question, Mapping):
+                return "JudgmentSpec.question must be a mapping"
+            if not isinstance(signal.decision.actions, Mapping) or not signal.decision.actions:
+                return "JudgmentSpec.actions must be a non-empty mapping"
+            if not all(
+                isinstance(action, ActionSpec) for action in signal.decision.actions.values()
+            ):
+                return "JudgmentSpec.actions values must be ActionSpec"
+            if (
+                not isinstance(signal.decision.fallback_label, str)
+                or not signal.decision.fallback_label
+            ):
+                return "JudgmentSpec.fallback_label must be a non-empty string"
+    return None
+
+
+def _coerce_pending(value: Any) -> dict[str, JsonObject]:
+    if not isinstance(value, Mapping):
+        return {}
+    pending: dict[str, JsonObject] = {}
+    for key, record in value.items():
+        if not isinstance(key, str) or not isinstance(record, Mapping):
+            continue
+        pending[key] = dict(record)
+    return pending
+
+
+def _sorted_pending(pending: Mapping[str, JsonObject]) -> JsonObject:
+    return {key: dict(pending[key]) for key in sorted(pending)}
+
+
+def _pending_reusable(record: Mapping[str, Any] | None, facts: Mapping[str, Any]) -> bool:
+    if not isinstance(record, Mapping):
+        return False
+    if not isinstance(record.get("action"), Mapping):
+        return False
+    if not isinstance(record.get("decision"), Mapping):
+        return False
+    digest = record.get("facts_digest")
+    return isinstance(digest, str) and digest == _facts_digest(facts)
+
+
+def _action_as_json(action: ActionSpec) -> JsonObject:
+    return {
+        "name": action.name,
+        "wake_agent": action.wake_agent,
+        "priority": action.priority,
+        "instruction": action.instruction,
+        "max_sentences": action.max_sentences,
+    }
+
+
+def _action_from_json(value: Any) -> ActionSpec | None:
+    if not isinstance(value, Mapping):
+        return None
+    name = value.get("name")
+    wake_agent = value.get("wake_agent")
+    priority = value.get("priority")
+    instruction = value.get("instruction", "")
+    max_sentences = value.get("max_sentences", 0)
+    if not isinstance(name, str) or not name:
+        return None
+    if not isinstance(wake_agent, bool):
+        return None
+    try:
+        priority_value = int(priority)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(instruction, str):
+        instruction = str(instruction)
+    try:
+        max_sentences_value = int(max_sentences)
+    except (TypeError, ValueError):
+        max_sentences_value = 0
+    return ActionSpec(
+        name=name,
+        wake_agent=wake_agent,
+        priority=priority_value,
+        instruction=instruction,
+        max_sentences=max_sentences_value,
+    )
+
+
+def _facts_digest(facts: Mapping[str, Any] | None) -> str:
+    payload = json.dumps(
+        _bound_facts(facts),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
 def _bound_facts(facts: Mapping[str, Any] | None) -> JsonObject:
     if not isinstance(facts, Mapping):
         return {}
-    bounded = _bound_value(dict(facts), depth=0)
+    bounded = {
+        str(key): _bound_value(value, depth=0)
+        for key, value in list(facts.items())[:_MAX_FACT_KEYS]
+    }
     return bounded if isinstance(bounded, dict) else {}
 
 
 def _bound_value(value: Any, *, depth: int) -> Any:
     if depth >= _MAX_FACT_DEPTH:
         return None
-    if isinstance(value, Mapping):
-        items = list(value.items())[:_MAX_FACT_KEYS]
-        return {
-            str(key)[:_MAX_FACT_STRING]: _bound_value(item, depth=depth + 1) for key, item in items
-        }
-    if isinstance(value, list):
-        return [_bound_value(item, depth=depth + 1) for item in value[:_MAX_FACT_LIST]]
-    if isinstance(value, tuple):
-        return [_bound_value(item, depth=depth + 1) for item in value[:_MAX_FACT_LIST]]
-    if isinstance(value, str):
-        return value if len(value) <= _MAX_FACT_STRING else value[:_MAX_FACT_STRING]
-    if isinstance(value, (int, float, bool)) or value is None:
+    if value is None or isinstance(value, (bool, int, float)):
         return value
+    if isinstance(value, str):
+        return value[:_MAX_FACT_STRING]
+    if isinstance(value, Mapping):
+        return {
+            str(key): _bound_value(item, depth=depth + 1)
+            for key, item in list(value.items())[:_MAX_FACT_KEYS]
+        }
+    if isinstance(value, (list, tuple)):
+        return [_bound_value(item, depth=depth + 1) for item in list(value)[:_MAX_FACT_LIST]]
     return str(value)[:_MAX_FACT_STRING]
 
 
@@ -530,7 +747,7 @@ def _iso(value: datetime) -> str:
 def _parse_time(value: Any) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
-    text = value.strip()
+    text = value
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
     try:

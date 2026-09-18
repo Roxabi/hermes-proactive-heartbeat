@@ -26,8 +26,8 @@ DEFAULT_PROMPT = (
     "heartbeat_candidate.delivery.instruction and respect "
     "heartbeat_candidate.delivery.max_sentences. Ground the message in "
     "heartbeat_candidate.inputs (collector observations) and "
-    "heartbeat_candidate.context. heartbeat_candidate.judgment is the gated action "
-    "(TypeSafe or fallback) — do not re-litigate it. Do not invent extra work. "
+    "heartbeat_candidate.context. heartbeat_candidate.decision is the authoritative "
+    "selected action (source rule, typesafe, or fallback) — do not re-litigate it. "
     "If nothing actionable remains, reply with exactly [SILENT]."
 )
 

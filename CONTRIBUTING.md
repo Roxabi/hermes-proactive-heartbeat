@@ -14,7 +14,7 @@ Thanks for helping improve `hermes-proactive-heartbeats`.
 This repository contains the generic plugin runtime only:
 
 - collection orchestration;
-- deterministic gates, TypeSafe batching, and deduplication;
+- deterministic decisions, semantic TypeSafe batching, and deduplication;
 - named heartbeat configuration loading;
 - Hermes Cron reconciliation;
 - the collector SDK.
