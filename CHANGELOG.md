@@ -4,6 +4,15 @@ All notable changes to this plugin are documented here. Versions follow
 [semantic versioning](https://semver.org/spec/v2.0.0.html); releases are tagged
 `proactive-heartbeats/vX.Y.Z`.
 
+## 0.1.1 — 2026-09-18
+
+### Fixed
+
+- Install docs: `hermes plugins install --ref` rejects anything that is not a full 40-character commit SHA, so the tag-based command shipped in 0.1.0 could not run. The install section now resolves a release tag to its commit — and warns that an unpeeled `git ls-remote` returns the annotated tag object, not a commit.
+- Concrete SHAs now live in the release notes only. Hardcoding one in the tree pins a release the tree has already moved past.
+
+No runtime change: the 0.1.0 collector SDK, engine behavior, and stdout contract are untouched.
+
 ## 0.1.0 — 2026-09-18
 
 First tagged release. Nothing before this tag was published, so the contract below is the baseline rather than a delta.
