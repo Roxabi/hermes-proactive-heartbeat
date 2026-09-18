@@ -179,14 +179,17 @@ class PluginTickHandlerTests(IsolatedHomeTestCase):
         handler = ctx.commands[0]["handler_fn"]
         args = SimpleNamespace(proactive_heartbeats_command="tick", name="care")
         stdout = io.StringIO()
+        cli_module = sys.modules[f"{PACKAGE_NAME}.cli"]
+        build_registry = mock.Mock(return_value=[])
+        engine_cls = mock.Mock(return_value=engine)
+        typesafe_cls = mock.Mock(return_value=object())
 
         with (
-            mock.patch(f"{PACKAGE_NAME}.registry.build_registry", return_value=[]),
-            mock.patch(
-                f"{PACKAGE_NAME}.engine.HeartbeatEngine",
-                return_value=engine,
-            ) as engine_cls,
-            mock.patch(f"{PACKAGE_NAME}.typesafe.TypeSafeClient", return_value=object()),
+            mock.patch.object(
+                cli_module,
+                "_import_tick_deps",
+                return_value=(engine_cls, build_registry, typesafe_cls),
+            ),
             mock.patch.object(sys, "stdout", stdout),
         ):
             exit_code = handler(args)
