@@ -55,7 +55,7 @@ class Snapshot:
 
 @dataclass(frozen=True)
 class Candidate:
-    """A resolved signal eligible for one Hermes agent wake."""
+    """Resolved wake payload: one or more observations packed for a single agent wake."""
 
     collector: str
     fingerprint: str
@@ -63,23 +63,34 @@ class Candidate:
     facts: JsonObject
     context: JsonObject = field(default_factory=dict)
     decision: JsonObject = field(default_factory=dict)
+    observations: tuple[JsonObject, ...] | None = None
 
     def as_json(self) -> JsonObject:
         metadata = self.decision if isinstance(self.decision, Mapping) else {}
         source = metadata.get("source")
+        decision = {
+            "action": self.action.name,
+            "source": source or "fallback",
+            **{key: value for key, value in metadata.items() if key not in {"action", "source"}},
+        }
+        if self.observations is not None:
+            inputs: Any = list(self.observations)
+        else:
+            inputs = [
+                {
+                    "collector": self.collector,
+                    "fingerprint": self.fingerprint,
+                    "facts": self.facts,
+                    "decision": decision,
+                }
+            ]
         return {
             "collector": self.collector,
             "fingerprint": self.fingerprint,
             "action": self.action.name,
             "priority": self.action.priority,
-            "inputs": self.facts,
-            "decision": {
-                "action": self.action.name,
-                "source": source or "fallback",
-                **{
-                    key: value for key, value in metadata.items() if key not in {"action", "source"}
-                },
-            },
+            "inputs": inputs,
+            "decision": decision,
             "context": self.context,
             "delivery": {
                 "instruction": self.action.instruction,

@@ -1,13 +1,4 @@
-[project]
-name = "hermes-proactive-heartbeats"
-version = "0.0.1"
-description = "Extensible proactive heartbeats plugin for Hermes"
-requires-python = ">=3.10"
-license = { text = "MIT" }
-
-[project.optional-dependencies]
-dev = ["ruff==0.15.10"]
-
+# Tooling only. Product version lives in plugin.yaml.
 [tool.ruff]
 line-length = 100
 target-version = "py310"

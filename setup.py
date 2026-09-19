@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import os
-import re
 import shlex
-import shutil
-import subprocess
 import textwrap
 from collections.abc import Mapping
 from pathlib import Path
@@ -20,19 +17,6 @@ except ImportError:  # flat plugin-dir / unittest load
 _LEGACY_SHIMS = ("proactive-heartbeat.sh", "proactive-heartbeat-tick.py")
 _LEGACY_JOB = "proactive-heartbeat"
 
-DEFAULT_PROMPT = (
-    "Proactive heartbeat wake. The pre-run script stdout ends with a JSON object. "
-    "When that object contains heartbeat_candidate, follow "
-    "heartbeat_candidate.delivery.instruction and respect "
-    "heartbeat_candidate.delivery.max_sentences. Ground the message in "
-    "heartbeat_candidate.inputs (collector observations) and "
-    "heartbeat_candidate.context. heartbeat_candidate.decision is the authoritative "
-    "selected action (source rule, typesafe, or fallback) — do not re-litigate it. "
-    "If nothing actionable remains, reply with exactly [SILENT]."
-)
-
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-
 
 def _config_mod() -> Any:
     try:
@@ -40,6 +24,14 @@ def _config_mod() -> Any:
     except ImportError:  # pragma: no cover
         import config as config_mod
     return config_mod
+
+
+def _cron_mod() -> Any:
+    try:
+        from . import cron as cron_mod
+    except ImportError:  # pragma: no cover
+        import cron as cron_mod
+    return cron_mod
 
 
 def resolve_hermes_home() -> Path:
@@ -56,14 +48,15 @@ def shim_path(home: Path | None, name: str) -> Path:
 
 
 def resolve_hermes_executable() -> str:
-    hermes = shutil.which("hermes")
-    if not hermes:
-        raise RuntimeError("hermes executable not found on PATH")
-    return hermes
+    return _cron_mod().resolve_hermes_executable()
+
+
+def find_cron_job(job_name: str) -> dict[str, str] | None:
+    return _cron_mod().find_cron_job(job_name)
 
 
 def _shim_source(name: str) -> str:
-    hermes = shlex.quote(resolve_hermes_executable())
+    hermes = shlex.quote(_cron_mod().resolve_hermes_executable())
     quoted = shlex.quote(name)
     return textwrap.dedent(
         f"""\
@@ -93,50 +86,9 @@ def _cleanup_legacy_shims(home: Path) -> None:
         if legacy.is_file():
             legacy.unlink()
     try:
-        _run_hermes(["cron", "remove", _LEGACY_JOB])
+        _cron_mod().run_hermes(["cron", "remove", _LEGACY_JOB])
     except RuntimeError:
         return
-
-
-def _run_hermes(args: list[str]) -> subprocess.CompletedProcess[str]:
-    hermes = resolve_hermes_executable()
-    return subprocess.run(
-        [hermes, *args],
-        check=False,
-        text=True,
-        capture_output=True,
-    )
-
-
-def list_cron_jobs() -> list[dict[str, str]]:
-    """Parse ``hermes cron list --all`` into id/name rows."""
-    try:
-        completed = _run_hermes(["cron", "list", "--all"])
-    except RuntimeError:
-        return []
-    if completed.returncode != 0:
-        return []
-    text = _ANSI_RE.sub("", completed.stdout)
-    jobs: list[dict[str, str]] = []
-    current_id = ""
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        id_match = re.match(r"^([0-9a-f]{12})\b", line)
-        if id_match:
-            current_id = id_match.group(1)
-            continue
-        name_match = re.match(r"^Name:\s*(.+)$", line)
-        if name_match:
-            jobs.append({"name": name_match.group(1).strip(), "id": current_id, "raw": line})
-    return jobs
-
-
-def find_cron_job(job_name: str) -> dict[str, str] | None:
-    """Read-only locate of a job via ``hermes cron list --all``."""
-    for job in list_cron_jobs():
-        if job["name"] == job_name:
-            return job
-    return None
 
 
 def _managed_heartbeat_name(job_name: str) -> str | None:
@@ -154,138 +106,10 @@ def _delivery_kwargs(delivery: Mapping[str, Any]) -> tuple[str, str, str | None]
     return schedule, deliver, failure_target or None
 
 
-def _edit_args(
-    job_ref: str,
-    *,
-    job_name: str,
-    schedule: str,
-    prompt: str,
-    deliver: str,
-    script_name: str,
-    failure_deliver: str | None,
-) -> list[str]:
-    args = [
-        "cron",
-        "edit",
-        job_ref,
-        "--name",
-        job_name,
-        "--schedule",
-        schedule,
-        "--prompt",
-        prompt,
-        "--deliver",
-        deliver,
-        "--script",
-        script_name,
-        "--agent",
-    ]
-    if failure_deliver:
-        args.extend(["--failure-deliver", failure_deliver])
-    return args
-
-
-def reconcile_cron_job(
-    *,
-    schedule: str,
-    deliver: str,
-    script_name: str,
-    failure_deliver: str | None = None,
-    prompt: str = DEFAULT_PROMPT,
-    job_name: str,
-) -> dict[str, Any]:
-    """Create or update one job through public ``hermes cron`` commands.
-
-    Always keeps ``no_agent=false`` (omit ``--no-agent`` on create; pass ``--agent`` on edit).
-    Never writes jobs.json directly. Edit-first against the stable job name avoids duplicates.
-    """
-    edit_completed = _run_hermes(
-        _edit_args(
-            job_name,
-            job_name=job_name,
-            schedule=schedule,
-            prompt=prompt,
-            deliver=deliver,
-            script_name=script_name,
-            failure_deliver=failure_deliver,
-        )
-    )
-    edit_blob = f"{edit_completed.stdout}\n{edit_completed.stderr}"
-    if edit_completed.returncode == 0:
-        job_id = ""
-        match = re.search(r"Updated job:\s*([0-9a-f]{12})", edit_completed.stdout)
-        if match:
-            job_id = match.group(1)
-        return {
-            "action": "updated",
-            "job_name": job_name,
-            "job_id": job_id,
-            "stdout": edit_completed.stdout.strip(),
-        }
-    if not re.search(r"Job not found", edit_blob, re.IGNORECASE):
-        detail = (
-            edit_completed.stderr or edit_completed.stdout or f"exit {edit_completed.returncode}"
-        ).strip()
-        raise RuntimeError(f"hermes cron edit failed: {detail}")
-
-    create_args = [
-        "cron",
-        "create",
-        schedule,
-        prompt,
-        "--name",
-        job_name,
-        "--deliver",
-        deliver,
-        "--script",
-        script_name,
-    ]
-    if failure_deliver:
-        create_args.extend(["--failure-deliver", failure_deliver])
-    create_completed = _run_hermes(create_args)
-    if create_completed.returncode == 0:
-        job_id = ""
-        match = re.search(r"Created job:\s*([0-9a-f]{12})", create_completed.stdout)
-        if match:
-            job_id = match.group(1)
-        return {
-            "action": "created",
-            "job_name": job_name,
-            "job_id": job_id,
-            "stdout": create_completed.stdout.strip(),
-        }
-
-    retry = _run_hermes(
-        _edit_args(
-            job_name,
-            job_name=job_name,
-            schedule=schedule,
-            prompt=prompt,
-            deliver=deliver,
-            script_name=script_name,
-            failure_deliver=failure_deliver,
-        )
-    )
-    if retry.returncode == 0:
-        job_id = ""
-        match = re.search(r"Updated job:\s*([0-9a-f]{12})", retry.stdout)
-        if match:
-            job_id = match.group(1)
-        return {
-            "action": "updated",
-            "job_name": job_name,
-            "job_id": job_id,
-            "stdout": retry.stdout.strip(),
-        }
-    detail = (
-        create_completed.stderr or create_completed.stdout or f"exit {create_completed.returncode}"
-    ).strip()
-    raise RuntimeError(f"hermes cron create failed: {detail}")
-
-
 def run_setup(*, config_dir: str | None = None) -> dict[str, Any]:
     """Write root skeleton and reconcile one cron job per heartbeat file."""
     config_mod = _config_mod()
+    cron_mod = _cron_mod()
     home = resolve_hermes_home()
     _cleanup_legacy_shims(home)
     root_file = config_mod.root_path(home, config_dir=config_dir)
@@ -301,7 +125,7 @@ def run_setup(*, config_dir: str | None = None) -> dict[str, Any]:
         settings = config_mod.load_heartbeat(home, name, root=root, config_dir=config_dir)
         shim = write_shim(home, name)
         schedule, deliver, failure_deliver = _delivery_kwargs(settings["delivery"])
-        result = reconcile_cron_job(
+        result = cron_mod.reconcile_cron_job(
             schedule=schedule,
             deliver=deliver,
             script_name=config_mod.shim_basename(name),
@@ -322,11 +146,11 @@ def run_setup(*, config_dir: str | None = None) -> dict[str, Any]:
         )
 
     desired = set(names)
-    for job in list_cron_jobs():
+    for job in cron_mod.list_cron_jobs():
         leftover = _managed_heartbeat_name(job["name"])
         if leftover is None or leftover in desired:
             continue
-        _run_hermes(["cron", "remove", job["name"]])
+        cron_mod.run_hermes(["cron", "remove", job["name"]])
         shim = shim_path(home, leftover)
         if shim.is_file():
             shim.unlink()

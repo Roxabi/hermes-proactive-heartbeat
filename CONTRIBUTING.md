@@ -75,6 +75,6 @@ A release is a tag plus a GitHub release; there is no publishing step and no rel
 3. After CI is green and the PR is merged with a merge commit, tag that merge commit `proactive-heartbeats/vX.Y.Z` and create the GitHub release from the changelog section.
 4. Put the tag's commit SHA in the release notes, never in the tree — `hermes plugins install --ref` accepts only a 40-character SHA, and a SHA committed to `README.md` or `CHANGELOG.md` pins a release the tree has already moved past.
 
-`plugin.yaml` `version`, the changelog heading, and the tag must agree.
+`plugin.yaml` `version`, the changelog heading, and the tag must agree. `pyproject.toml` is Ruff config only — it must not carry a product version.
 
 By contributing, you agree that your contribution is licensed under the repository's MIT license.
