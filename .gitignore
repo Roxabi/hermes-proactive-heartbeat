@@ -6,3 +6,7 @@ __pycache__/
 .ruff_cache/
 .semctx/
 .env
+
+# Local indexes (machine-only)
+/.cocoindex_code/
+/.codegraph/

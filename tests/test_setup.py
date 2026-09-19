@@ -39,8 +39,8 @@ class SetupReconcileTests(IsolatedHomeTestCase):
 
         mock_hermes = "/mock/bin/hermes"
         with (
-            mock.patch("setup._run_hermes", side_effect=fake_run),
-            mock.patch("setup.resolve_hermes_executable", return_value=mock_hermes),
+            mock.patch("cron.run_hermes", side_effect=fake_run),
+            mock.patch("cron.resolve_hermes_executable", return_value=mock_hermes),
         ):
             summary = run_setup()
 

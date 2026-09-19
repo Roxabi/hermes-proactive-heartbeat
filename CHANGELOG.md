@@ -4,6 +4,26 @@ All notable changes to this plugin are documented here. Versions follow
 [semantic versioning](https://semver.org/spec/v2.0.0.html); releases are tagged
 `proactive-heartbeats/vX.Y.Z`.
 
+## 0.3.0 — 2026-09-18
+
+### Changed
+
+- A tick no longer picks a single winner. Every due signal whose resolved action
+  wakes the agent is packed into one `heartbeat_candidate`. `inputs` is always a
+  list of observations `{collector, fingerprint, facts, decision}`. Priority only
+  orders that list. Hermes Cron still sees one stdout object and one agent wake.
+- Delivered observations are stamped immediately, so cooldown applies to each of
+  them. Losers are no longer queued in `pending`. `pending` remains the
+  fail-closed retry queue when a collector errors.
+- The managed cron prompt tells the woken agent to cover every input and not
+  re-open whether to speak.
+
+### Migration
+
+- Collectors do not change. Operators who parsed `inputs` as a single facts
+  object must read a list. `setup` rewrites the cron prompt.
+
+
 ## 0.2.1 — 2026-09-18
 
 ### Fixed
